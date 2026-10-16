@@ -196,17 +196,31 @@ def cleanup_audio(audio_path: Path) -> None:
 class HealthHandler(BaseHTTPRequestHandler):
     """Minimal Render health endpoint; Telegram polling remains in the main thread."""
 
+    def _health_body(self) -> bytes:
+        return json.dumps({"status": "ok", "service": "telegram-gemini-tts"}).encode()
+
     def do_GET(self) -> None:
-        if self.path.rstrip("/") != "/health":
+        if self.path.rstrip("/") not in ("", "/health"):
             self.send_response(404)
             self.end_headers()
             return
-        body = json.dumps({"status": "ok", "service": "telegram-gemini-tts"}).encode()
+        body = self._health_body()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_HEAD(self) -> None:
+        if self.path.rstrip("/") not in ("", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = self._health_body()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
 
     def log_message(self, format: str, *args: object) -> None:
         logger.info("health-server: " + format, *args)
