@@ -326,7 +326,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"This text will be sent as {len(chunks)} voice notes.")
 
     for index, chunk in enumerate(chunks, start=1):
-        await update.message.chat.send_action(ChatAction.UPLOAD_AUDIO)
+        # Telegram has no UPLOAD_AUDIO chat action; UPLOAD_DOCUMENT is the
+        # supported generic action while the result is sent with reply_audio.
+        await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         audio_path = None
         try:
             audio_path = await __import__("asyncio").to_thread(
