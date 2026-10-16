@@ -1,10 +1,12 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-gemini-tts
     runtime: docker
+    plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    autoDeploy: true
+    healthCheckPath: /health
+    autoDeployTrigger: commit
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false

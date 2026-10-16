@@ -1,9 +1,12 @@
 import base64
+import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import requests
@@ -37,6 +40,7 @@ if not ALLOWED_TELEGRAM_USER_IDS:
     raise ValueError("Configure at least one Telegram user ID")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash-tts")
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "4000"))
+PORT = int(os.getenv("PORT", "10000"))
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
 # Official Gemini prebuilt TTS catalog: 30 documented voices.
@@ -189,6 +193,33 @@ def cleanup_audio(audio_path: Path) -> None:
     audio_path.parent.rmdir()
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Minimal Render health endpoint; Telegram polling remains in the main thread."""
+
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps({"status": "ok", "service": "telegram-gemini-tts"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        logger.info("health-server: " + format, *args)
+
+
+def start_health_server() -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
+    thread.start()
+    logger.info("Health endpoint listening on 0.0.0.0:%s/health", PORT)
+    return server
+
+
 def split_text_for_tts(text: str, max_length: int = MAX_TEXT_LENGTH) -> list[str]:
     """Split long text at paragraph/sentence/word boundaries without exceeding the TTS limit."""
     if len(text) <= max_length:
@@ -324,6 +355,7 @@ def build_application() -> Application:
 
 
 if __name__ == "__main__":
+    start_health_server()
     logger.info(
         "Starting Gemini TTS bot for %s authorized users: model=%s voice=%s speed=%s",
         len(ALLOWED_TELEGRAM_USER_IDS), GEMINI_MODEL, current_voice, current_speed,
