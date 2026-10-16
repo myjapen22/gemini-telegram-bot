@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: telegram-gemini-tts
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ALLOWED_TELEGRAM_USER_IDS
+        value: "7589831382"
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash-tts
+      - key: DEFAULT_VOICE
+        value: Kore
+      - key: DEFAULT_SPEED
+        value: normal
+      - key: MAX_TEXT_LENGTH
+        value: "4000"
