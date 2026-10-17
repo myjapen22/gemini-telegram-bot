@@ -23,6 +23,7 @@ TELEGRAM_BOT_TOKEN=<BotFather token>
 GEMINI_API_KEY=<Google AI Studio API key>
 ALLOWED_TELEGRAM_USER_IDS=7589831382
 GEMINI_MODEL=gemini-3.8-flash-tts
+GEMINI_FALLBACK_MODEL=gemini-3.8-flash-lite-tts
 DEFAULT_VOICE=Kore
 DEFAULT_SPEED=normal
 MAX_TEXT_LENGTH=4000
@@ -71,3 +72,5 @@ python bot.py
 - `/setspeed` — Slow, Normal, Fast
 
 Messages longer than 4,000 characters are split safely into multiple downloadable MP3 files. Unauthorized users receive a private-bot message and cannot call Gemini.
+
+The primary model is Google's Gemini 3.8 Flash TTS model. If it returns a temporary 429/5xx error, the bot makes one attempt with the supported Gemini 3.8 Flash-Lite TTS model. A 429 caused by the project's Free Tier daily quota cannot be bypassed by changing the API key or using `gemini-2.0-flash`; that model is not a TTS audio-output model. The bot logs the exact status, model, and sanitized API response and reports quota failures clearly in Telegram.

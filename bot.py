@@ -39,6 +39,7 @@ ALLOWED_TELEGRAM_USER_IDS = {
 if not ALLOWED_TELEGRAM_USER_IDS:
     raise ValueError("Configure at least one Telegram user ID")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash-tts")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash-lite-tts")
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "4000"))
 PORT = int(os.getenv("PORT", "10000"))
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -134,11 +135,18 @@ def extract_audio_base64(payload: dict) -> str | None:
     return None
 
 
-def synthesize_speech(text: str, voice: str, speed: str) -> Path:
-    """Generate Gemini TTS WAV audio and convert it to a downloadable MP3 file."""
+class GeminiTTSAPIError(RuntimeError):
+    def __init__(self, status_code: int, model: str, body: str):
+        self.status_code = status_code
+        self.model = model
+        self.body = body
+        super().__init__(f"Gemini TTS API error {status_code} for {model}: {body[:1000]}")
+
+
+def _generate_audio_base64(text: str, voice: str, model: str, speed: str) -> str:
     delivery = f"{FIXED_STYLE}; {SPEEDS[speed]}"
     payload = {
-        "model": GEMINI_MODEL,
+        "model": model,
         "input": [{
             "type": "user_input",
             "content": [{
@@ -160,10 +168,44 @@ def synthesize_speech(text: str, voice: str, speed: str) -> Path:
         timeout=120,
     )
     if not response.ok:
-        raise RuntimeError(f"Gemini TTS API error {response.status_code}: {response.text[:1000]}")
-    audio_b64 = extract_audio_base64(response.json())
+        raise GeminiTTSAPIError(response.status_code, model, response.text)
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Gemini returned non-JSON response for {model}: {response.text[:1000]}") from exc
+    audio_b64 = extract_audio_base64(response_payload)
     if not audio_b64:
-        raise RuntimeError(f"Gemini returned no audio data: {response.text[:1000]}")
+        raise RuntimeError(f"Gemini returned no audio data for {model}: {response.text[:1000]}")
+    return audio_b64
+
+
+def synthesize_speech(text: str, voice: str, speed: str) -> Path:
+    """Generate Gemini TTS WAV audio and convert it to a downloadable MP3 file."""
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL not in models:
+        models.append(GEMINI_FALLBACK_MODEL)
+    audio_b64 = None
+    last_api_error = None
+    for model_index, model in enumerate(models):
+        try:
+            audio_b64 = _generate_audio_base64(text, voice, model, speed)
+            if model_index:
+                logger.info("Gemini TTS fallback succeeded: model=%s voice=%s", model, voice)
+            break
+        except GeminiTTSAPIError as exc:
+            last_api_error = exc
+            logger.error(
+                "Gemini TTS request failed: model=%s status=%s voice=%s body=%s",
+                exc.model, exc.status_code, voice, exc.body[:2000],
+            )
+            if model_index == 0 and exc.status_code in {429, 500, 502, 503, 504} and len(models) > 1:
+                logger.warning("Trying Gemini TTS fallback model=%s after primary failure", GEMINI_FALLBACK_MODEL)
+                continue
+            raise
+    if not audio_b64:
+        if last_api_error:
+            raise last_api_error
+        raise RuntimeError("Gemini returned no audio data")
 
     temp_dir = Path(tempfile.mkdtemp(prefix="telegram-gemini-tts-"))
     wav_path = temp_dir / "speech.wav"
@@ -191,6 +233,20 @@ def cleanup_audio(audio_path: Path) -> None:
     for leftover in audio_path.parent.iterdir():
         leftover.unlink(missing_ok=True)
     audio_path.parent.rmdir()
+
+
+def tts_failure_message(exc: Exception) -> str:
+    if isinstance(exc, GeminiTTSAPIError):
+        if exc.status_code == 429:
+            return (
+                "Google Gemini TTS quota/rate limit reached for this API project. "
+                "Please wait for the quota reset or enable a paid Gemini tier."
+            )
+        if exc.status_code in {500, 502, 503, 504}:
+            return "Google Gemini TTS is temporarily busy. Please try again in a few minutes."
+        if exc.status_code in {401, 403}:
+            return "The Gemini API key is invalid or lacks access to the selected TTS model."
+    return "I could not generate audio right now. Please try again later."
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -324,11 +380,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     title=f"{current_voice} Burmese voice preview",
                     performer="Gemini TTS",
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("Voice preview generation failed for %s", current_voice)
-            await query.message.reply_text(
-                f"Voice changed to {current_voice}, but I could not generate the preview right now."
-            )
+            await query.message.reply_text(f"Voice changed to {current_voice}, but {tts_failure_message(exc)}")
         finally:
             if audio_path:
                 cleanup_audio(audio_path)
@@ -364,11 +418,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     title=f"Gemini Story {index}",
                     performer="Gemini TTS",
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("Gemini TTS voice generation failed for chunk %s/%s", index, len(chunks))
-            await update.message.reply_text(
-                f"I could not generate audio file {index} of {len(chunks)}. Please try again later."
-            )
+            await update.message.reply_text(f"Audio file {index} of {len(chunks)} failed: {tts_failure_message(exc)}")
             break
         finally:
             if audio_path:

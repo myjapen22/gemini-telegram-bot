@@ -16,6 +16,8 @@ services:
         value: "7589831382"
       - key: GEMINI_MODEL
         value: gemini-3.8-flash-tts
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-3.8-flash-lite-tts
       - key: DEFAULT_VOICE
         value: Kore
       - key: DEFAULT_SPEED
