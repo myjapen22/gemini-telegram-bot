@@ -307,8 +307,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if index < 0 or index >= len(VOICE_CATALOG):
             await query.edit_message_text("Unknown voice selection.")
             return
-        current_voice = VOICE_CATALOG[index][0]
-        await query.edit_message_text(f"Voice changed to {current_voice}.")
+        current_voice, gender = VOICE_CATALOG[index]
+        await query.edit_message_text(f"Voice changed to {current_voice}. Generating a Burmese preview…")
+        speaker = "ကျွန်တော်" if gender == "Male" else "ကျွန်မ"
+        preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {current_voice} ဖြစ်ပါတယ်။"
+        audio_path = None
+        try:
+            await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            audio_path = await __import__("asyncio").to_thread(
+                synthesize_speech, preview_text, current_voice, current_speed
+            )
+            with audio_path.open("rb") as audio_file:
+                await query.message.reply_audio(
+                    audio=audio_file,
+                    filename=f"{current_voice.lower()}_burmese_preview.mp3",
+                    title=f"{current_voice} Burmese voice preview",
+                    performer="Gemini TTS",
+                )
+        except Exception:
+            logger.exception("Voice preview generation failed for %s", current_voice)
+            await query.message.reply_text(
+                f"Voice changed to {current_voice}, but I could not generate the preview right now."
+            )
+        finally:
+            if audio_path:
+                cleanup_audio(audio_path)
     elif kind == "speed" and value in SPEEDS:
         current_speed = value
         await query.edit_message_text(f"Speed changed to {value.title()}.")
