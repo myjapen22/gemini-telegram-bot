@@ -96,11 +96,27 @@ SPEED_LABELS = {
     "fast": "1.25x Fast",
     "very_fast": "1.5x Very Fast",
 }
+STYLE_CATALOG = [
+    ("suspense", "Suspense & Thriller", "Speak like a tense Burmese movie narrator building suspense and anticipation."),
+    ("dramatic", "Dramatic & Emotional", "Speak like a dramatic Burmese movie narrator with deep emotion and expressive feeling."),
+    ("recap", "Fast-Paced Recap", "Speak like a fast, clear Burmese movie recap narrator with energetic pacing."),
+    ("action", "Action & Energetic", "Speak like an action movie narrator in Burmese: powerful, urgent, and energetic."),
+    ("funny", "Funny & Conversational", "Speak like a funny, friendly Burmese storyteller having a lively conversation."),
+    ("horror", "Dark & Horror", "Speak like a dark Burmese horror narrator: eerie, low, tense, and unsettling."),
+    ("street", "Local Burmese Street-Talk", "Speak naturally like a local Burmese storyteller using relaxed, authentic street-talk."),
+    ("trailer", "Epic & Cinematic Trailer", "Speak like an epic Burmese movie trailer narrator with grand cinematic intensity."),
+    ("nostalgic", "Soft & Sad / Nostalgic", "Speak softly like a sad, nostalgic Burmese movie narrator with tender emotion."),
+    ("satirical", "Satirical & Sarcastic", "Speak like a witty Burmese narrator using playful satire and dry sarcasm."),
+]
+STYLE_NAMES = {key: label for key, label, _ in STYLE_CATALOG}
+STYLE_PROMPTS = {key: prompt for key, _, prompt in STYLE_CATALOG}
 current_voice = DEFAULT_VOICE
 current_speed = os.getenv("DEFAULT_SPEED", "normal")
 if current_speed not in SPEEDS:
     current_speed = "normal"
-FIXED_STYLE = "Professional cinematic movie storyteller style, natural and expressive tone"
+current_style = os.getenv("DEFAULT_STYLE", "trailer")
+if current_style not in STYLE_NAMES:
+    current_style = "trailer"
 
 
 def is_owner(update: Update) -> bool:
@@ -135,10 +151,24 @@ def speed_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def style_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✓ ' if current_style == key else ''}{label}",
+            callback_data=f"style:{key}",
+        )
+        for key, label, _ in STYLE_CATALOG
+    ]
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎙 Select Voice", callback_data="menu:voice")],
         [InlineKeyboardButton("⚡ Select Speed", callback_data="menu:speed")],
+        [InlineKeyboardButton("🎬 Select Movie Style", callback_data="menu:style")],
     ])
 
 
@@ -147,6 +177,7 @@ def welcome_text() -> str:
         "Welcome to the private Gemini TTS bot.\n\n"
         f"Current voice: {current_voice}\n"
         f"Current speed: {SPEED_LABELS[current_speed]}\n\n"
+        f"Current style: {STYLE_NAMES[current_style]}\n\n"
         "Choose a setting below, then send me any text."
     )
 
@@ -172,8 +203,8 @@ class GeminiTTSAPIError(RuntimeError):
         super().__init__(f"Gemini TTS API error {status_code} for {model}: {body[:1000]}")
 
 
-def _generate_audio_base64(text: str, voice: str, model: str, speed: str) -> str:
-    delivery = f"{FIXED_STYLE}; {SPEEDS[speed]}"
+def _generate_audio_base64(text: str, voice: str, model: str, speed: str, style: str) -> str:
+    delivery = f"{STYLE_PROMPTS[style]}; {SPEEDS[speed]}"
     payload = {
         "model": model,
         "input": [{
@@ -208,7 +239,7 @@ def _generate_audio_base64(text: str, voice: str, model: str, speed: str) -> str
     return audio_b64
 
 
-def synthesize_speech(text: str, voice: str, speed: str) -> Path:
+def synthesize_speech(text: str, voice: str, speed: str, style: str = "trailer") -> Path:
     """Generate Gemini TTS WAV audio and convert it to a downloadable MP3 file."""
     models = [GEMINI_MODEL]
     if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL not in models:
@@ -217,7 +248,7 @@ def synthesize_speech(text: str, voice: str, speed: str) -> Path:
     last_api_error = None
     for model_index, model in enumerate(models):
         try:
-            audio_b64 = _generate_audio_base64(text, voice, model, speed)
+            audio_b64 = _generate_audio_base64(text, voice, model, speed, style)
             if model_index:
                 logger.info("Gemini TTS fallback succeeded: model=%s voice=%s", model, voice)
             break
@@ -396,7 +427,7 @@ async def setspeed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global current_voice, current_speed
+    global current_voice, current_speed, current_style
     query = update.callback_query
     if not query or not is_owner(update):
         return
@@ -414,6 +445,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Current speed: {SPEED_LABELS[current_speed]}\nChoose a speech speed:",
             reply_markup=speed_keyboard(),
         )
+    elif kind == "menu" and value == "style":
+        await query.edit_message_text(
+            f"Current movie style: {STYLE_NAMES[current_style]}\nChoose a voiceover style:",
+            reply_markup=style_keyboard(),
+        )
     elif kind == "voice":
         index = int(value)
         if index < 0 or index >= len(VOICE_CATALOG):
@@ -427,7 +463,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             audio_path = await __import__("asyncio").to_thread(
-                synthesize_speech, preview_text, current_voice, current_speed
+                synthesize_speech, preview_text, current_voice, current_speed, current_style
             )
             with audio_path.open("rb") as audio_file:
                 await query.message.reply_audio(
@@ -446,6 +482,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         current_speed = value
         await query.edit_message_text(
             f"Speed changed to {SPEED_LABELS[value]}.",
+            reply_markup=start_keyboard(),
+        )
+    elif kind == "style" and value in STYLE_NAMES:
+        current_style = value
+        await query.edit_message_text(
+            f"Movie style changed to {STYLE_NAMES[value]}.",
             reply_markup=start_keyboard(),
         )
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -472,7 +514,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             audio_path = await __import__("asyncio").to_thread(
-                synthesize_speech, chunk, current_voice, current_speed
+                synthesize_speech, chunk, current_voice, current_speed, current_style
             )
             progress_task.cancel()
             await asyncio.gather(progress_task, return_exceptions=True)
@@ -515,7 +557,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setvoice", setvoice_command))
     application.add_handler(CommandHandler("setspeed", setspeed_command))
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed):"))
+    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style):"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_other_message))
     return application
