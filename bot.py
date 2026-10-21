@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import logging
 import os
@@ -84,9 +85,16 @@ if DEFAULT_VOICE not in VOICE_NAMES:
     DEFAULT_VOICE = "Kore"
 
 SPEEDS = {
-    "slow": "slow, deliberate pace",
+    "very_slow": "very slow, deliberate pace",
     "normal": "natural conversational pace",
     "fast": "brisk, energetic pace",
+    "very_fast": "very fast, energetic pace",
+}
+SPEED_LABELS = {
+    "very_slow": "0.75x Very Slow",
+    "normal": "1.0x Normal",
+    "fast": "1.25x Fast",
+    "very_fast": "1.5x Very Fast",
 }
 current_voice = DEFAULT_VOICE
 current_speed = os.getenv("DEFAULT_SPEED", "normal")
@@ -110,15 +118,36 @@ def voice_keyboard() -> InlineKeyboardMarkup:
         label = f"{'✓ ' if name == current_voice else ''}{name} ({gender[0]})"
         buttons.append(InlineKeyboardButton(label, callback_data=f"voice:{index}"))
     rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
 
 def speed_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(f"{'✓ ' if current_speed == key else ''}{key.title()}", callback_data=f"speed:{key}")
-            for key in SPEEDS
-        ]]
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✓ ' if current_speed == key else ''}{SPEED_LABELS[key]}",
+            callback_data=f"speed:{key}",
+        )
+        for key in SPEEDS
+    ]
+    return InlineKeyboardMarkup([[button] for button in buttons] + [[
+        InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")
+    ]])
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎙 Select Voice", callback_data="menu:voice")],
+        [InlineKeyboardButton("⚡ Select Speed", callback_data="menu:speed")],
+    ])
+
+
+def welcome_text() -> str:
+    return (
+        "Welcome to the private Gemini TTS bot.\n\n"
+        f"Current voice: {current_voice}\n"
+        f"Current speed: {SPEED_LABELS[current_speed]}\n\n"
+        "Choose a setting below, then send me any text."
     )
 
 
@@ -249,6 +278,24 @@ def tts_failure_message(exc: Exception) -> str:
     return "I could not generate audio right now. Please try again later."
 
 
+def progress_bar(percent: int, width: int = 10) -> str:
+    filled = max(0, min(width, round(percent * width / 100)))
+    return f"[{'█' * filled}{'░' * (width - filled)}] {percent}%"
+
+
+async def animate_progress(status_message, prefix: str = "Generating audio") -> None:
+    """Keep Telegram status visibly moving while the blocking TTS request runs."""
+    stages = (15, 25, 35, 45, 55, 65, 75, 82)
+    try:
+        for percent in stages:
+            await asyncio.sleep(2.5)
+            await status_message.edit_text(f"{prefix}... {progress_bar(percent)}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Unable to update Telegram progress message", exc_info=True)
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     """Minimal Render health endpoint; Telegram polling remains in the main thread."""
 
@@ -325,10 +372,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_owner(update):
         await reject_unauthorized(update)
     elif update.message:
-        await update.message.reply_text(
-            f"Private Gemini TTS bot ready. Voice: {current_voice}; speed: {current_speed}.\n"
-            "Use /setvoice or /setspeed."
-        )
+        await update.message.reply_text(welcome_text(), reply_markup=start_keyboard())
 
 
 async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -346,7 +390,7 @@ async def setspeed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await reject_unauthorized(update)
     elif update.message:
         await update.message.reply_text(
-            f"Current speed: {current_speed.title()}\nChoose a speed:",
+            f"Current speed: {SPEED_LABELS[current_speed]}\nChoose a speed:",
             reply_markup=speed_keyboard(),
         )
 
@@ -358,7 +402,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await query.answer()
     kind, value = query.data.split(":", 1)
-    if kind == "voice":
+    if kind == "menu" and value == "home":
+        await query.edit_message_text(welcome_text(), reply_markup=start_keyboard())
+    elif kind == "menu" and value == "voice":
+        await query.edit_message_text(
+            f"Current voice: {current_voice}\nChoose a Gemini voice:",
+            reply_markup=voice_keyboard(),
+        )
+    elif kind == "menu" and value == "speed":
+        await query.edit_message_text(
+            f"Current speed: {SPEED_LABELS[current_speed]}\nChoose a speech speed:",
+            reply_markup=speed_keyboard(),
+        )
+    elif kind == "voice":
         index = int(value)
         if index < 0 or index >= len(VOICE_CATALOG):
             await query.edit_message_text("Unknown voice selection.")
@@ -388,7 +444,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 cleanup_audio(audio_path)
     elif kind == "speed" and value in SPEEDS:
         current_speed = value
-        await query.edit_message_text(f"Speed changed to {value.title()}.")
+        await query.edit_message_text(
+            f"Speed changed to {SPEED_LABELS[value]}.",
+            reply_markup=start_keyboard(),
+        )
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
@@ -405,11 +464,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for index, chunk in enumerate(chunks, start=1):
         # Telegram has no UPLOAD_AUDIO chat action; UPLOAD_DOCUMENT is the
         # supported generic action while the result is sent with reply_audio.
-        await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        status_message = await update.message.reply_text(
+            f"Generating audio ({index}/{len(chunks)})... {progress_bar(5)}"
+        )
+        progress_task = asyncio.create_task(animate_progress(status_message))
         audio_path = None
         try:
+            await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             audio_path = await __import__("asyncio").to_thread(
                 synthesize_speech, chunk, current_voice, current_speed
+            )
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+            await status_message.edit_text(
+                f"Preparing MP3 audio ({index}/{len(chunks)})... {progress_bar(90)}"
             )
             with audio_path.open("rb") as audio_file:
                 await update.message.reply_audio(
@@ -418,9 +486,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     title=f"Gemini Story {index}",
                     performer="Gemini TTS",
                 )
+            await status_message.edit_text(
+                f"Audio ready ({index}/{len(chunks)})... {progress_bar(100)}"
+            )
         except Exception as exc:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
             logger.exception("Gemini TTS voice generation failed for chunk %s/%s", index, len(chunks))
-            await update.message.reply_text(f"Audio file {index} of {len(chunks)} failed: {tts_failure_message(exc)}")
+            await status_message.edit_text(
+                f"Audio generation failed ({index}/{len(chunks)})... {progress_bar(100)}\n"
+                f"{tts_failure_message(exc)}"
+            )
             break
         finally:
             if audio_path:
@@ -439,7 +515,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setvoice", setvoice_command))
     application.add_handler(CommandHandler("setspeed", setspeed_command))
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(voice|speed):"))
+    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed):"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_other_message))
     return application

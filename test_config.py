@@ -17,7 +17,13 @@ import bot  # noqa: E402
 
 assert len(bot.VOICE_CATALOG) == 30
 assert {"Aoede", "Charon", "Fenrir", "Kore", "Puck", "Despina", "Iapetus", "Rasalgethi", "Sadachbia", "Sulafat", "Zephyr"} <= bot.VOICE_NAMES
-assert set(bot.SPEEDS) == {"slow", "normal", "fast"}
+assert set(bot.SPEEDS) == {"very_slow", "normal", "fast", "very_fast"}
+assert bot.SPEED_LABELS == {
+    "very_slow": "0.75x Very Slow",
+    "normal": "1.0x Normal",
+    "fast": "1.25x Fast",
+    "very_fast": "1.5x Very Fast",
+}
 assert bot.ALLOWED_TELEGRAM_USER_IDS
 app = bot.build_application()
 assert app is not None
