@@ -110,6 +110,29 @@ STYLE_CATALOG = [
 ]
 STYLE_NAMES = {key: label for key, label, _ in STYLE_CATALOG}
 STYLE_PROMPTS = {key: prompt for key, _, prompt in STYLE_CATALOG}
+STYLE_DESCRIPTIONS = {
+    "suspense": "💡 သင့်တော်သည့် ဇာတ်လမ်း: သဲထိတ်ရင်ဖို၊ စုံထောက်၊ မှုခင်းဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Charon",
+    "dramatic": "💡 သင့်တော်သည့် ဇာတ်လမ်း: အချစ်၊ မိသားစု၊ ဘဝဇာတ်ကြောင်း ဒရာမာများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Kore သို့မဟုတ် Leda",
+    "recap": "💡 သင့်တော်သည့် ဇာတ်လမ်း: Shorts, TikTok, Facebook Reels, 5 Min Recaps\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Achird သို့မဟုတ် Fenrir",
+    "action": "💡 သင့်တော်သည့် ဇာတ်လမ်း: အက်ရှင်၊ သိုင်းဇာတ်လမ်း၊ စူပါဟီးရိုးများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Fenrir သို့မဟုတ် Orion",
+    "funny": "💡 သင့်တော်သည့် ဇာတ်လမ်း: ဟာသ၊ အန်နီမေးရှင်း ကာတွန်း၊ ပေါ့ပေါ့ပါးပါး ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Achird",
+    "horror": "💡 သင့်တော်သည့် ဇာတ်လမ်း: သရဲကား၊ စိတ္တဇ လူသတ်သမား၊ ခြောက်ခြားဖွယ် ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Charon",
+    "street": "💡 သင့်တော်သည့် ဇာတ်လမ်း: TikTok/Facebook Short Video၊ လူငယ်ကြိုက် ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Achird သို့မဟုတ် Puck",
+    "trailer": "💡 သင့်တော်သည့် ဇာတ်လမ်း: ရုပ်ရှင် ကြော်ငြာအသံ၊ Sci-Fi၊ သမိုင်းဝင် ကာတွန်း/ရုပ်ရှင်များ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Orion သို့မဟုတ် Charon",
+    "nostalgic": "💡 သင့်တော်သည့် ဇာတ်လမ်း: ဝမ်းနည်းဖွယ် အချစ်၊ မိသားစု ဒရာမာများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Leda သို့မဟုတ် Kore",
+    "satirical": "💡 သင့်တော်သည့် ဇာတ်လမ်း: Movie Mistakes Review၊ စောင်းမြောင်း ရယ်စရာ ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Achird",
+}
+VOICE_DESCRIPTIONS = {
+    "Kore": "💡 အချစ်၊ မိသားစု၊ ဒရာမာနှင့် ဝမ်းနည်းဖွယ် ဇာတ်လမ်းများအတွက် အထူးကောင်းမွန်သည်။",
+    "Leda": "💡 အေးဆေးညင်သာသော ဇာတ်လမ်းများ၊ ပုံပြင်များနှင့် အလွမ်းကားများအတွက် သင့်တော်သည်။",
+    "Puck": "💡 စုံထောက်၊ သဲထိတ်ရင်ဖို၊ ဟာသနှင့် ပေါ့ပေါ့ပါးပါး Movie Review များအတွက် အထူးကောင်းမွန်သည်။",
+    "Charon": "💡 သရဲကား၊ စိတ္တဇ လူသတ်သမားနှင့် Horror ဇာတ်လမ်းများအတွက် အနက်သံ အကောင်းဆုံးဖြစ်သည်။",
+    "Fenrir": "💡 အက်ရှင်၊ TikTok Shorts နှင့် မြန်မြန်ဆန်ဆန် ဇာတ်လမ်းပြောပြရန် သင့်တော်သည်။",
+    "Achird": "💡 အက်ရှင်၊ TikTok Shorts နှင့် မြန်မြန်ဆန်ဆန် ဇာတ်လမ်းပြောပြရန် သင့်တော်သည်။",
+    "Orion": "💡 Superhero ကားများနှင့် ရုပ်ရှင် ကြော်ငြာအသံ (Trailer Style) အတွက် အသံဩဇာ အပြည့်ပါသည်။",
+}
+FEMALE_VOICE_FALLBACK = "💡 အချစ်၊ မိသားစု၊ ဒရာမာ၊ ပုံပြင်များနှင့် အေးဆေးညင်သာသော ဇာတ်လမ်းများအတွက် သင့်တော်ပါသည်။"
+MALE_VOICE_FALLBACK = "💡 အက်ရှင်၊ သဲထိတ်ရင်ဖို၊ စုံထောက်၊ TikTok/Reels Shorts နှင့် Movie Recaps များအတွက် သင့်တော်ပါသည်။"
 current_voice = DEFAULT_VOICE
 current_speed = os.getenv("DEFAULT_SPEED", "normal")
 if current_speed not in SPEEDS:
@@ -136,6 +159,12 @@ def voice_keyboard() -> InlineKeyboardMarkup:
     rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
+
+
+def voice_description(name: str, gender: str) -> str:
+    if name in VOICE_DESCRIPTIONS:
+        return VOICE_DESCRIPTIONS[name]
+    return FEMALE_VOICE_FALLBACK if gender == "Female" else MALE_VOICE_FALLBACK
 
 
 def speed_keyboard() -> InlineKeyboardMarkup:
@@ -410,8 +439,10 @@ async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_owner(update):
         await reject_unauthorized(update)
     elif update.message:
+        current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
         await update.message.reply_text(
-            f"Current voice: {current_voice}\nChoose one of the {len(VOICE_CATALOG)} Gemini voices:",
+            f"Current voice: {current_voice} ({current_gender})\n{voice_description(current_voice, current_gender)}\n\n"
+            f"Choose one of the {len(VOICE_CATALOG)} Gemini voices:",
             reply_markup=voice_keyboard(),
         )
 
@@ -436,8 +467,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if kind == "menu" and value == "home":
         await query.edit_message_text(welcome_text(), reply_markup=start_keyboard())
     elif kind == "menu" and value == "voice":
+        current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
         await query.edit_message_text(
-            f"Current voice: {current_voice}\nChoose a Gemini voice:",
+            f"Current voice: {current_voice} ({current_gender})\n{voice_description(current_voice, current_gender)}\n\n"
+            "Choose a Gemini voice:",
             reply_markup=voice_keyboard(),
         )
     elif kind == "menu" and value == "speed":
@@ -447,7 +480,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     elif kind == "menu" and value == "style":
         await query.edit_message_text(
-            f"Current movie style: {STYLE_NAMES[current_style]}\nChoose a voiceover style:",
+            f"Current movie style: {STYLE_NAMES[current_style]}\n{STYLE_DESCRIPTIONS[current_style]}\n\n"
+            "Choose a voiceover style:",
             reply_markup=style_keyboard(),
         )
     elif kind == "voice":
@@ -456,7 +490,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text("Unknown voice selection.")
             return
         current_voice, gender = VOICE_CATALOG[index]
-        await query.edit_message_text(f"Voice changed to {current_voice}. Generating a Burmese preview…")
+        description = voice_description(current_voice, gender)
+        await query.edit_message_text(
+            f"Voice changed to {current_voice} ({gender}).\n{description}\n\n"
+            "Generating a Burmese preview…"
+        )
         speaker = "ကျွန်တော်" if gender == "Male" else "ကျွန်မ"
         preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {current_voice} ဖြစ်ပါတယ်။"
         audio_path = None
@@ -487,7 +525,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif kind == "style" and value in STYLE_NAMES:
         current_style = value
         await query.edit_message_text(
-            f"Movie style changed to {STYLE_NAMES[value]}.",
+            f"Movie style changed to {STYLE_NAMES[value]}.\n\n{STYLE_DESCRIPTIONS[value]}",
             reply_markup=start_keyboard(),
         )
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
