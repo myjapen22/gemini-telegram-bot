@@ -151,12 +151,15 @@ async def reject_unauthorized(update: Update) -> None:
         await update.message.reply_text("Sorry, this bot is private and only available to authorized users.")
 
 
-def voice_keyboard() -> InlineKeyboardMarkup:
+def voice_keyboard(pending_index: int | None = None) -> InlineKeyboardMarkup:
     buttons = []
     for index, (name, gender) in enumerate(VOICE_CATALOG):
-        label = f"{'✓ ' if name == current_voice else ''}{name} ({gender[0]})"
+        marker = "⏳ " if pending_index == index else "✓ " if name == current_voice else ""
+        label = f"{marker}{name} ({gender[0]})"
         buttons.append(InlineKeyboardButton(label, callback_data=f"voice:{index}"))
     rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
+    if pending_index is not None:
+        rows.append([InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:voice:{pending_index}")])
     rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -180,15 +183,17 @@ def speed_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def style_keyboard() -> InlineKeyboardMarkup:
+def style_keyboard(pending_key: str | None = None) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
-            f"{'✓ ' if current_style == key else ''}{label}",
+            f"{'⏳ ' if pending_key == key else '✓ ' if current_style == key else ''}{label}",
             callback_data=f"style:{key}",
         )
         for key, label, _ in STYLE_CATALOG
     ]
     rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    if pending_key is not None:
+        rows.append([InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:style:{pending_key}")])
     rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -509,6 +514,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 reply_markup=style_keyboard(),
             )
     elif kind == "menu" and value == "home":
+        context.user_data.pop("pending_voice_index", None)
+        context.user_data.pop("pending_style_key", None)
         await query.edit_message_text(welcome_text(), reply_markup=start_keyboard())
     elif kind == "menu" and value == "voice":
         current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
@@ -537,9 +544,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["pending_voice_index"] = index
         description = voice_description(preview_voice, gender)
         await query.edit_message_text(
-            f"Voice preview: {preview_voice} ({gender})\n{description}\n\n"
-            "This voice has not been applied yet. Preview audio is being generated…",
-            reply_markup=confirmation_keyboard("voice", str(index)),
+            f"Selected: {preview_voice} ({gender}) — Pending Confirmation\n"
+            f"{description}\n\n"
+            "Preview audio is being generated. Use ✅ Confirm to apply this voice.",
+            reply_markup=voice_keyboard(index),
         )
         speaker = "ကျွန်တော်" if gender == "Male" else "ကျွန်မ"
         preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {preview_voice} ဖြစ်ပါတယ်။"
@@ -571,9 +579,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif kind == "style" and value in STYLE_NAMES:
         context.user_data["pending_style_key"] = value
         await query.edit_message_text(
-            f"Style preview: {STYLE_NAMES[value]}\n\n{STYLE_DESCRIPTIONS[value]}\n\n"
-            "This style has not been applied yet. Click Confirm / Select to use it.",
-            reply_markup=confirmation_keyboard("style", value),
+            f"Selected: {STYLE_NAMES[value]} — Pending Confirmation\n\n"
+            f"{STYLE_DESCRIPTIONS[value]}\n\n"
+            "Use ✅ Confirm to apply this movie style.",
+            reply_markup=style_keyboard(value),
         )
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
