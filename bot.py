@@ -193,6 +193,13 @@ def style_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def confirmation_keyboard(kind: str, value: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm / Select", callback_data=f"confirm:{kind}:{value}")],
+        [InlineKeyboardButton("🔙 Back to List", callback_data=f"back:{kind}")],
+    ])
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎙 Select Voice", callback_data="menu:voice")],
@@ -464,7 +471,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await query.answer()
     kind, value = query.data.split(":", 1)
-    if kind == "menu" and value == "home":
+    if kind == "confirm":
+        confirm_kind, confirm_value = value.split(":", 1)
+        if confirm_kind == "voice":
+            index = int(confirm_value)
+            if context.user_data.get("pending_voice_index") != index or not 0 <= index < len(VOICE_CATALOG):
+                await query.edit_message_text("This voice preview has expired. Please choose a voice again.", reply_markup=voice_keyboard())
+                return
+            current_voice = VOICE_CATALOG[index][0]
+            context.user_data.pop("pending_voice_index", None)
+            await query.edit_message_text(
+                f"✅ Voice selected: {current_voice}\n{voice_description(current_voice, VOICE_CATALOG[index][1])}",
+                reply_markup=start_keyboard(),
+            )
+        elif confirm_kind == "style":
+            if context.user_data.get("pending_style_key") != confirm_value or confirm_value not in STYLE_NAMES:
+                await query.edit_message_text("This style preview has expired. Please choose a style again.", reply_markup=style_keyboard())
+                return
+            current_style = confirm_value
+            context.user_data.pop("pending_style_key", None)
+            await query.edit_message_text(
+                f"✅ Movie style selected: {STYLE_NAMES[current_style]}\n\n{STYLE_DESCRIPTIONS[current_style]}",
+                reply_markup=start_keyboard(),
+            )
+    elif kind == "back":
+        context.user_data.pop("pending_voice_index", None)
+        context.user_data.pop("pending_style_key", None)
+        if value == "voice":
+            current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
+            await query.edit_message_text(
+                f"Current voice: {current_voice} ({current_gender})\n{voice_description(current_voice, current_gender)}\n\nChoose a Gemini voice:",
+                reply_markup=voice_keyboard(),
+            )
+        elif value == "style":
+            await query.edit_message_text(
+                f"Current movie style: {STYLE_NAMES[current_style]}\n{STYLE_DESCRIPTIONS[current_style]}\n\nChoose a voiceover style:",
+                reply_markup=style_keyboard(),
+            )
+    elif kind == "menu" and value == "home":
         await query.edit_message_text(welcome_text(), reply_markup=start_keyboard())
     elif kind == "menu" and value == "voice":
         current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
@@ -489,30 +533,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if index < 0 or index >= len(VOICE_CATALOG):
             await query.edit_message_text("Unknown voice selection.")
             return
-        current_voice, gender = VOICE_CATALOG[index]
-        description = voice_description(current_voice, gender)
+        preview_voice, gender = VOICE_CATALOG[index]
+        context.user_data["pending_voice_index"] = index
+        description = voice_description(preview_voice, gender)
         await query.edit_message_text(
-            f"Voice changed to {current_voice} ({gender}).\n{description}\n\n"
-            "Generating a Burmese preview…"
+            f"Voice preview: {preview_voice} ({gender})\n{description}\n\n"
+            "This voice has not been applied yet. Preview audio is being generated…",
+            reply_markup=confirmation_keyboard("voice", str(index)),
         )
         speaker = "ကျွန်တော်" if gender == "Male" else "ကျွန်မ"
-        preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {current_voice} ဖြစ်ပါတယ်။"
+        preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {preview_voice} ဖြစ်ပါတယ်။"
         audio_path = None
         try:
             await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             audio_path = await __import__("asyncio").to_thread(
-                synthesize_speech, preview_text, current_voice, current_speed, current_style
+                synthesize_speech, preview_text, preview_voice, current_speed, current_style
             )
             with audio_path.open("rb") as audio_file:
                 await query.message.reply_audio(
                     audio=audio_file,
-                    filename=f"{current_voice.lower()}_burmese_preview.mp3",
-                    title=f"{current_voice} Burmese voice preview",
+                    filename=f"{preview_voice.lower()}_burmese_preview.mp3",
+                    title=f"{preview_voice} Burmese voice preview",
                     performer="Gemini TTS",
                 )
         except Exception as exc:
-            logger.exception("Voice preview generation failed for %s", current_voice)
-            await query.message.reply_text(f"Voice changed to {current_voice}, but {tts_failure_message(exc)}")
+            logger.exception("Voice preview generation failed for %s", preview_voice)
+            await query.message.reply_text(f"Preview for {preview_voice} failed: {tts_failure_message(exc)}")
         finally:
             if audio_path:
                 cleanup_audio(audio_path)
@@ -523,10 +569,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=start_keyboard(),
         )
     elif kind == "style" and value in STYLE_NAMES:
-        current_style = value
+        context.user_data["pending_style_key"] = value
         await query.edit_message_text(
-            f"Movie style changed to {STYLE_NAMES[value]}.\n\n{STYLE_DESCRIPTIONS[value]}",
-            reply_markup=start_keyboard(),
+            f"Style preview: {STYLE_NAMES[value]}\n\n{STYLE_DESCRIPTIONS[value]}\n\n"
+            "This style has not been applied yet. Click Confirm / Select to use it.",
+            reply_markup=confirmation_keyboard("style", value),
         )
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
@@ -595,7 +642,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setvoice", setvoice_command))
     application.add_handler(CommandHandler("setspeed", setspeed_command))
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style):"))
+    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style|confirm|back):"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_other_message))
     return application
