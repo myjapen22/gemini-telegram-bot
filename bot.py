@@ -336,6 +336,26 @@ def cleanup_audio(audio_path: Path) -> None:
     audio_path.parent.rmdir()
 
 
+def convert_to_voice_note(mp3_path: Path) -> Path:
+    """Convert a generated MP3 preview to Telegram Voice Note OGG/Opus."""
+    ogg_path = mp3_path.parent / "preview.ogg"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
+                "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", "-vn", str(ogg_path),
+            ],
+            check=True,
+            timeout=90,
+        )
+        if not ogg_path.exists() or ogg_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg produced an empty OGG voice note")
+        return ogg_path
+    except Exception:
+        ogg_path.unlink(missing_ok=True)
+        raise
+
+
 def tts_failure_message(exc: Exception) -> str:
     if isinstance(exc, GeminiTTSAPIError):
         if exc.status_code == 429:
@@ -552,23 +572,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         speaker = "ကျွန်တော်" if gender == "Male" else "ကျွန်မ"
         preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {preview_voice} ဖြစ်ပါတယ်။"
         audio_path = None
+        voice_note_path = None
         try:
             await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             audio_path = await __import__("asyncio").to_thread(
                 synthesize_speech, preview_text, preview_voice, current_speed, current_style
             )
-            with audio_path.open("rb") as audio_file:
-                await query.message.reply_audio(
-                    audio=audio_file,
-                    filename=f"{preview_voice.lower()}_burmese_preview.mp3",
-                    title=f"{preview_voice} Burmese voice preview",
-                    performer="Gemini TTS",
-                )
+            voice_note_path = await __import__("asyncio").to_thread(convert_to_voice_note, audio_path)
+            with voice_note_path.open("rb") as voice_file:
+                await query.message.reply_voice(voice=voice_file)
         except Exception as exc:
             logger.exception("Voice preview generation failed for %s", preview_voice)
             await query.message.reply_text(f"Preview for {preview_voice} failed: {tts_failure_message(exc)}")
         finally:
-            if audio_path:
+            if voice_note_path:
+                cleanup_audio(voice_note_path)
+            elif audio_path:
                 cleanup_audio(audio_path)
     elif kind == "speed" and value in SPEEDS:
         current_speed = value
@@ -581,9 +600,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             f"Selected: {STYLE_NAMES[value]} — Pending Confirmation\n\n"
             f"{STYLE_DESCRIPTIONS[value]}\n\n"
-            "Use ✅ Confirm to apply this movie style.",
+            "Generating a style preview voice note. Use ✅ Confirm to apply this movie style.",
             reply_markup=style_keyboard(value),
         )
+        style_preview_text = f"မင်္ဂလာပါ။ ဒီအသံပုံစံက {STYLE_NAMES[value]} ဖြစ်ပါတယ်။"
+        audio_path = None
+        voice_note_path = None
+        try:
+            await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            audio_path = await __import__("asyncio").to_thread(
+                synthesize_speech, style_preview_text, current_voice, current_speed, value
+            )
+            voice_note_path = await __import__("asyncio").to_thread(convert_to_voice_note, audio_path)
+            with voice_note_path.open("rb") as voice_file:
+                await query.message.reply_voice(voice=voice_file)
+        except Exception as exc:
+            logger.exception("Style preview generation failed for %s", value)
+            await query.message.reply_text(f"Preview for {STYLE_NAMES[value]} failed: {tts_failure_message(exc)}")
+        finally:
+            if voice_note_path:
+                cleanup_audio(voice_note_path)
+            elif audio_path:
+                cleanup_audio(audio_path)
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
