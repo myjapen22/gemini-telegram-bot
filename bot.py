@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import shutil
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -460,6 +461,111 @@ def split_text_for_tts(text: str, max_length: int = MAX_TEXT_LENGTH) -> list[str
     return chunks
 
 
+SPEAKER_LABEL_RE = re.compile(
+    r"^\s*(?:\[\s*)?(?P<label>speaker\s*\d+|narrator|host|guest|character\s*\d+|[A-Za-z][A-Za-z0-9 _'-]{0,29})(?:\s*\])?\s*[:：]\s*(?P<text>.+)$",
+    re.IGNORECASE,
+)
+
+
+def parse_script(text: str) -> list[tuple[str, str]]:
+    """Parse common screenplay/dialogue labels while keeping unlabeled text as Narrator."""
+    segments: list[tuple[str, str]] = []
+    current_label = "Narrator"
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        content = " ".join(line.strip() for line in current_lines if line.strip()).strip()
+        if content:
+            segments.append((current_label, content))
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush()
+            current_lines.clear()
+            continue
+        match = SPEAKER_LABEL_RE.match(line)
+        if match:
+            flush()
+            current_lines.clear()
+            current_label = re.sub(r"\s+", " ", match.group("label")).strip().title()
+            current_lines.append(match.group("text"))
+        else:
+            current_lines.append(line)
+    flush()
+
+    if not segments:
+        return [("Narrator", text.strip())]
+    return segments
+
+
+def voice_for_speaker(label: str, speaker_order: list[str]) -> str:
+    """Choose a stable voice profile from role/name hints and speaker order."""
+    normalized = label.lower()
+    if normalized in {"narrator", "host"}:
+        return current_voice
+    female_hints = ("female", "woman", "girl", "mother", "wife", "မ", "မိန်း", "အမေ")
+    male_hints = ("male", "man", "boy", "father", "husband", "ကျွန်တော်", "အမျိုးသား")
+    if any(hint in normalized for hint in female_hints):
+        return "Kore"
+    if any(hint in normalized for hint in male_hints):
+        return "Puck"
+    dialogue_speakers = [speaker for speaker in speaker_order if speaker.lower() not in {"narrator", "host"}]
+    ordinal = dialogue_speakers.index(label) if label in dialogue_speakers else len(dialogue_speakers)
+    if ordinal % 2 == 0:
+        return "Puck"
+    return "Kore"
+
+
+def expand_script_segments(text: str) -> list[tuple[str, str, str]]:
+    """Return (speaker, text, assigned voice), splitting oversized blocks safely."""
+    parsed = parse_script(text)
+    speaker_order: list[str] = []
+    for speaker, _ in parsed:
+        if speaker not in speaker_order:
+            speaker_order.append(speaker)
+    expanded: list[tuple[str, str, str]] = []
+    for speaker, block in parsed:
+        assigned_voice = voice_for_speaker(speaker, speaker_order)
+        for chunk in split_text_for_tts(block):
+            expanded.append((speaker, chunk, assigned_voice))
+    return expanded
+
+
+def compile_script_to_mp3(segments: list[tuple[str, str, str]], speed: str, style: str) -> Path:
+    """Synthesize all speaker segments and concatenate them into one MP3."""
+    master_dir = Path(tempfile.mkdtemp(prefix="telegram-gemini-script-"))
+    segment_paths: list[Path] = []
+    try:
+        for index, (_, segment_text, assigned_voice) in enumerate(segments, start=1):
+            generated = synthesize_speech(segment_text, assigned_voice, speed, style)
+            target = master_dir / f"segment_{index:04d}.mp3"
+            shutil.copy2(generated, target)
+            cleanup_audio(generated)
+            segment_paths.append(target)
+        if not segment_paths:
+            raise ValueError("No speech segments were detected")
+        concat_list = master_dir / "concat.txt"
+        concat_list.write_text("\n".join(f"file '{path.name}'" for path in segment_paths) + "\n", encoding="utf-8")
+        final_path = master_dir / "voiceover.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+             "-i", str(concat_list), "-c:a", "libmp3lame", "-b:a", "192k", "-vn", str(final_path)],
+            check=True,
+            timeout=max(120, 30 * len(segment_paths)),
+            cwd=master_dir,
+        )
+        if not final_path.exists() or final_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg produced an empty combined MP3 file")
+        for path in segment_paths:
+            path.unlink(missing_ok=True)
+        concat_list.unlink(missing_ok=True)
+        return final_path
+    except Exception:
+        shutil.rmtree(master_dir, ignore_errors=True)
+        raise
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
@@ -631,50 +737,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.strip()
     if not text:
         return
-    chunks = split_text_for_tts(text)
-    if len(chunks) > 1:
-        await update.message.reply_text(f"This text will be sent as {len(chunks)} voice notes.")
-
-    for index, chunk in enumerate(chunks, start=1):
-        # Telegram has no UPLOAD_AUDIO chat action; UPLOAD_DOCUMENT is the
-        # supported generic action while the result is sent with reply_audio.
-        status_message = await update.message.reply_text(
-            f"Generating audio ({index}/{len(chunks)})... {progress_bar(5)}"
+    segments = expand_script_segments(text)
+    speaker_count = len({speaker for speaker, _, _ in segments})
+    status_message = await update.message.reply_text(
+        f"Analyzing {speaker_count} speaker role(s) and generating one combined MP3... {progress_bar(5)}"
+    )
+    progress_task = asyncio.create_task(animate_progress(status_message, "Generating combined audio"))
+    audio_path = None
+    try:
+        await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        logger.info(
+            "Multi-speaker script detected: segments=%s speakers=%s assignments=%s",
+            len(segments), speaker_count, [(speaker, voice) for speaker, _, voice in segments],
         )
-        progress_task = asyncio.create_task(animate_progress(status_message))
-        audio_path = None
-        try:
-            await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-            audio_path = await __import__("asyncio").to_thread(
-                synthesize_speech, chunk, current_voice, current_speed, current_style
+        audio_path = await asyncio.to_thread(
+            compile_script_to_mp3, segments, current_speed, current_style
+        )
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+        await status_message.edit_text(
+            f"Combining {len(segments)} speaker segment(s) into one MP3... {progress_bar(90)}"
+        )
+        with audio_path.open("rb") as audio_file:
+            await update.message.reply_document(
+                document=audio_file,
+                filename="voiceover.mp3",
+                caption=f"Combined multi-speaker voiceover ({speaker_count} detected role(s))",
             )
-            progress_task.cancel()
-            await asyncio.gather(progress_task, return_exceptions=True)
-            await status_message.edit_text(
-                f"Preparing MP3 audio ({index}/{len(chunks)})... {progress_bar(90)}"
-            )
-            with audio_path.open("rb") as audio_file:
-                await update.message.reply_audio(
-                    audio=audio_file,
-                    filename=f"gemini_story_{index}.mp3",
-                    title=f"Gemini Story {index}",
-                    performer="Gemini TTS",
-                )
-            await status_message.edit_text(
-                f"Audio ready ({index}/{len(chunks)})... {progress_bar(100)}"
-            )
-        except Exception as exc:
-            progress_task.cancel()
-            await asyncio.gather(progress_task, return_exceptions=True)
-            logger.exception("Gemini TTS voice generation failed for chunk %s/%s", index, len(chunks))
-            await status_message.edit_text(
-                f"Audio generation failed ({index}/{len(chunks)})... {progress_bar(100)}\n"
-                f"{tts_failure_message(exc)}"
-            )
-            break
-        finally:
-            if audio_path:
-                cleanup_audio(audio_path)
+        await status_message.edit_text(f"Voiceover ready... {progress_bar(100)}")
+    except Exception as exc:
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+        logger.exception("Combined multi-speaker Gemini TTS generation failed")
+        await status_message.edit_text(
+            f"Combined audio generation failed... {progress_bar(100)}\n{tts_failure_message(exc)}"
+        )
+    finally:
+        if audio_path:
+            shutil.rmtree(audio_path.parent, ignore_errors=True)
 
 
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
