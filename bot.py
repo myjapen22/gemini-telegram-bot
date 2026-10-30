@@ -111,6 +111,14 @@ STYLE_CATALOG = [
 ]
 STYLE_NAMES = {key: label for key, label, _ in STYLE_CATALOG}
 STYLE_PROMPTS = {key: prompt for key, _, prompt in STYLE_CATALOG}
+VOICE_MODES = {
+    "single": "👤 Single Speaker",
+    "multi": "👥 Multi-Speaker",
+}
+VOICE_MODE_DESCRIPTIONS = {
+    "single": "အသံတစ်သံတည်းဖြင့် စာသားတစ်ခုလုံးကို Narrator အဖြစ် ဖတ်ပေးမည်။",
+    "multi": "Speaker/Narrator/Character အလိုက် အလိုအလျောက်ခွဲပြီး အသံများပြောင်းကာ ဇာတ်ညွှန်းတစ်ခုလုံးကို MP3 တစ်ဖိုင်အဖြစ် ပေါင်းပေးမည်။",
+}
 STYLE_DESCRIPTIONS = {
     "suspense": "💡 သင့်တော်သည့် ဇာတ်လမ်း: သဲထိတ်ရင်ဖို၊ စုံထောက်၊ မှုခင်းဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Charon",
     "dramatic": "💡 သင့်တော်သည့် ဇာတ်လမ်း: အချစ်၊ မိသားစု၊ ဘဝဇာတ်ကြောင်း ဒရာမာများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Kore သို့မဟုတ် Leda",
@@ -141,6 +149,9 @@ if current_speed not in SPEEDS:
 current_style = os.getenv("DEFAULT_STYLE", "trailer")
 if current_style not in STYLE_NAMES:
     current_style = "trailer"
+current_voice_mode = os.getenv("VOICE_MODE", "multi")
+if current_voice_mode not in VOICE_MODES:
+    current_voice_mode = "multi"
 
 
 def is_owner(update: Update) -> bool:
@@ -199,6 +210,19 @@ def style_keyboard(pending_key: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def voice_mode_keyboard(pending_mode: str | None = None) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(
+            f"{'⏳ ' if pending_mode == key else '✓ ' if current_voice_mode == key else ''}{label}",
+            callback_data=f"mode:{key}",
+        )
+    ] for key, label in VOICE_MODES.items()]
+    if pending_mode is not None:
+        rows.append([InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:mode:{pending_mode}")])
+    rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
 def confirmation_keyboard(kind: str, value: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm / Select", callback_data=f"confirm:{kind}:{value}")],
@@ -209,6 +233,7 @@ def confirmation_keyboard(kind: str, value: str) -> InlineKeyboardMarkup:
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎙 Select Voice", callback_data="menu:voice")],
+        [InlineKeyboardButton("🗣 Select Voice Mode", callback_data="menu:mode")],
         [InlineKeyboardButton("⚡ Select Speed", callback_data="menu:speed")],
         [InlineKeyboardButton("🎬 Select Movie Style", callback_data="menu:style")],
     ])
@@ -218,6 +243,7 @@ def welcome_text() -> str:
     return (
         "Welcome to the private Gemini TTS bot.\n\n"
         f"Current voice: {current_voice}\n"
+        f"Voice mode: {VOICE_MODES[current_voice_mode]}\n"
         f"Current speed: {SPEED_LABELS[current_speed]}\n\n"
         f"Current style: {STYLE_NAMES[current_style]}\n\n"
         "Choose a setting below, then send me any text."
@@ -596,7 +622,7 @@ async def setspeed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global current_voice, current_speed, current_style
+    global current_voice, current_speed, current_style, current_voice_mode
     query = update.callback_query
     if not query or not is_owner(update):
         return
@@ -625,6 +651,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"✅ Movie style selected: {STYLE_NAMES[current_style]}\n\n{STYLE_DESCRIPTIONS[current_style]}",
                 reply_markup=start_keyboard(),
             )
+        elif confirm_kind == "mode":
+            if context.user_data.get("pending_voice_mode") != confirm_value or confirm_value not in VOICE_MODES:
+                await query.edit_message_text(
+                    "This Voice Mode selection has expired. Please choose again.",
+                    reply_markup=voice_mode_keyboard(),
+                )
+                return
+            current_voice_mode = confirm_value
+            context.user_data.pop("pending_voice_mode", None)
+            await query.edit_message_text(
+                f"✅ Voice Mode selected: {VOICE_MODES[current_voice_mode]}\n{VOICE_MODE_DESCRIPTIONS[current_voice_mode]}",
+                reply_markup=start_keyboard(),
+            )
     elif kind == "back":
         context.user_data.pop("pending_voice_index", None)
         context.user_data.pop("pending_style_key", None)
@@ -642,6 +681,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif kind == "menu" and value == "home":
         context.user_data.pop("pending_voice_index", None)
         context.user_data.pop("pending_style_key", None)
+        context.user_data.pop("pending_voice_mode", None)
         await query.edit_message_text(welcome_text(), reply_markup=start_keyboard())
     elif kind == "menu" and value == "voice":
         current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
@@ -654,6 +694,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             f"Current speed: {SPEED_LABELS[current_speed]}\nChoose a speech speed:",
             reply_markup=speed_keyboard(),
+        )
+    elif kind == "menu" and value == "mode":
+        await query.edit_message_text(
+            f"Current Voice Mode: {VOICE_MODES[current_voice_mode]}\n{VOICE_MODE_DESCRIPTIONS[current_voice_mode]}\n\n"
+            "Choose how the script should be spoken:",
+            reply_markup=voice_mode_keyboard(),
         )
     elif kind == "menu" and value == "style":
         await query.edit_message_text(
@@ -728,6 +774,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 cleanup_audio(voice_note_path)
             elif audio_path:
                 cleanup_audio(audio_path)
+    elif kind == "mode" and value in VOICE_MODES:
+        context.user_data["pending_voice_mode"] = value
+        await query.edit_message_text(
+            f"Selected: {VOICE_MODES[value]} — Pending Confirmation\n\n"
+            f"{VOICE_MODE_DESCRIPTIONS[value]}\n\n"
+            "Use ✅ Confirm to apply this Voice Mode.",
+            reply_markup=voice_mode_keyboard(value),
+        )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
@@ -737,17 +793,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.strip()
     if not text:
         return
-    segments = expand_script_segments(text)
+    if current_voice_mode == "single":
+        segments = [("Narrator", chunk, current_voice) for chunk in split_text_for_tts(text)]
+        mode_label = VOICE_MODES["single"]
+    else:
+        segments = expand_script_segments(text)
+        mode_label = VOICE_MODES["multi"]
     speaker_count = len({speaker for speaker, _, _ in segments})
     status_message = await update.message.reply_text(
-        f"Analyzing {speaker_count} speaker role(s) and generating one combined MP3... {progress_bar(5)}"
+        f"{mode_label}: analyzing {speaker_count} role(s) and generating one combined MP3... {progress_bar(5)}"
     )
     progress_task = asyncio.create_task(animate_progress(status_message, "Generating combined audio"))
     audio_path = None
     try:
         await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         logger.info(
-            "Multi-speaker script detected: segments=%s speakers=%s assignments=%s",
+            "Voice mode=%s segments=%s speakers=%s assignments=%s",
+            current_voice_mode,
             len(segments), speaker_count, [(speaker, voice) for speaker, _, voice in segments],
         )
         audio_path = await asyncio.to_thread(
@@ -762,7 +824,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_document(
                 document=audio_file,
                 filename="voiceover.mp3",
-                caption=f"Combined multi-speaker voiceover ({speaker_count} detected role(s))",
+                caption=f"Combined {mode_label} voiceover ({speaker_count} role(s))",
             )
         await status_message.edit_text(f"Voiceover ready... {progress_bar(100)}")
     except Exception as exc:
@@ -789,7 +851,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setvoice", setvoice_command))
     application.add_handler(CommandHandler("setspeed", setspeed_command))
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style|confirm|back):"))
+    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style|mode|confirm|back):"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_other_message))
     return application
