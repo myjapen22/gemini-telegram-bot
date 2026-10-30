@@ -488,13 +488,15 @@ def split_text_for_tts(text: str, max_length: int = MAX_TEXT_LENGTH) -> list[str
 
 
 SPEAKER_LABEL_RE = re.compile(
-    r"^\s*(?:\[\s*)?(?P<label>speaker\s*\d+|narrator|host|guest|character\s*\d+|[A-Za-z][A-Za-z0-9 _'-]{0,29})(?:\s*\])?\s*[:：]\s*(?P<text>.+)$",
+    # Any non-empty label before a line-leading colon is metadata only. This
+    # intentionally supports Burmese names such as ရှာနန်းဝေး, စနစ်, and ဂျန်ဂျုန်း.
+    r"^\s*(?:\[\s*)?(?P<label>[^:：\[\]\n]{1,60})(?:\s*\])?\s*[:：]\s*(?P<text>.+)$",
     re.IGNORECASE,
 )
 
 
 def parse_script(text: str) -> list[tuple[str, str]]:
-    """Parse common screenplay/dialogue labels while keeping unlabeled text as Narrator."""
+    """Parse labels as routing metadata; never include the labels in spoken text."""
     segments: list[tuple[str, str]] = []
     current_label = "Narrator"
     current_lines: list[str] = []
@@ -514,8 +516,10 @@ def parse_script(text: str) -> list[tuple[str, str]]:
         if match:
             flush()
             current_lines.clear()
-            current_label = re.sub(r"\s+", " ", match.group("label")).strip().title()
-            current_lines.append(match.group("text"))
+            current_label = re.sub(r"\s+", " ", match.group("label")).strip()
+            # Only the captured dialogue text is retained; the label and its
+            # separator are deliberately discarded before TTS synthesis.
+            current_lines.append(match.group("text").strip())
         else:
             current_lines.append(line)
     flush()
