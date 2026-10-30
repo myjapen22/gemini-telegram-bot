@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -43,6 +44,9 @@ if not ALLOWED_TELEGRAM_USER_IDS:
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash-tts")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash-lite-tts")
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "4000"))
+TTS_INTER_SEGMENT_DELAY_SECONDS = float(os.getenv("TTS_INTER_SEGMENT_DELAY_SECONDS", "1.0"))
+TTS_FALLBACK_RETRIES = max(1, int(os.getenv("TTS_FALLBACK_RETRIES", "2")))
+TTS_RETRY_BACKOFF_SECONDS = float(os.getenv("TTS_RETRY_BACKOFF_SECONDS", "2.0"))
 PORT = int(os.getenv("PORT", "10000"))
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
@@ -308,28 +312,47 @@ def _generate_audio_base64(text: str, voice: str, model: str, speed: str, style:
 
 
 def synthesize_speech(text: str, voice: str, speed: str, style: str = "trailer") -> Path:
-    """Generate Gemini TTS WAV audio and convert it to a downloadable MP3 file."""
+    """Generate audio with per-turn primary/lite fallback and transient retries."""
     models = [GEMINI_MODEL]
     if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL not in models:
         models.append(GEMINI_FALLBACK_MODEL)
     audio_b64 = None
     last_api_error = None
+    retryable_statuses = {429, 500, 502, 503, 504}
     for model_index, model in enumerate(models):
-        try:
-            audio_b64 = _generate_audio_base64(text, voice, model, speed, style)
-            if model_index:
-                logger.info("Gemini TTS fallback succeeded: model=%s voice=%s", model, voice)
+        # The primary gets one attempt before the lite fallback is invoked.
+        # The fallback gets bounded retries so one transient response does not
+        # abort the entire combined multi-speaker file.
+        max_attempts = TTS_FALLBACK_RETRIES if model_index else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                audio_b64 = _generate_audio_base64(text, voice, model, speed, style)
+                if model_index:
+                    logger.info(
+                        "Gemini TTS fallback succeeded for speaker turn: model=%s voice=%s attempt=%s",
+                        model, voice, attempt,
+                    )
+                break
+            except GeminiTTSAPIError as exc:
+                last_api_error = exc
+                logger.error(
+                    "Gemini TTS request failed: model=%s status=%s voice=%s attempt=%s/%s body=%s",
+                    exc.model, exc.status_code, voice, attempt, max_attempts, exc.body[:2000],
+                )
+                if model_index == 0 and exc.status_code in retryable_statuses and len(models) > 1:
+                    logger.warning(
+                        "Primary model rate-limited/unavailable for this speaker turn; "
+                        "invoking fallback model=%s",
+                        GEMINI_FALLBACK_MODEL,
+                    )
+                    break
+                if exc.status_code not in retryable_statuses or attempt >= max_attempts:
+                    raise
+                delay = TTS_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning("Retrying fallback model after %.1fs for speaker turn", delay)
+                time.sleep(delay)
+        if audio_b64:
             break
-        except GeminiTTSAPIError as exc:
-            last_api_error = exc
-            logger.error(
-                "Gemini TTS request failed: model=%s status=%s voice=%s body=%s",
-                exc.model, exc.status_code, voice, exc.body[:2000],
-            )
-            if model_index == 0 and exc.status_code in {429, 500, 502, 503, 504} and len(models) > 1:
-                logger.warning("Trying Gemini TTS fallback model=%s after primary failure", GEMINI_FALLBACK_MODEL)
-                continue
-            raise
     if not audio_b64:
         if last_api_error:
             raise last_api_error
@@ -568,6 +591,16 @@ def compile_script_to_mp3(segments: list[tuple[str, str, str]], speed: str, styl
     segment_paths: list[Path] = []
     try:
         for index, (_, segment_text, assigned_voice) in enumerate(segments, start=1):
+            if index > 1 and TTS_INTER_SEGMENT_DELAY_SECONDS > 0:
+                logger.info(
+                    "Rate-limit pacing: waiting %.2fs before speaker turn %s/%s",
+                    TTS_INTER_SEGMENT_DELAY_SECONDS, index, len(segments),
+                )
+                time.sleep(TTS_INTER_SEGMENT_DELAY_SECONDS)
+            logger.info(
+                "Synthesizing speaker turn %s/%s with voice=%s; fallback=%s",
+                index, len(segments), assigned_voice, GEMINI_FALLBACK_MODEL,
+            )
             generated = synthesize_speech(segment_text, assigned_voice, speed, style)
             target = master_dir / f"segment_{index:04d}.mp3"
             shutil.copy2(generated, target)
