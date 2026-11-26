@@ -2,6 +2,7 @@ import base64
 import asyncio
 import json
 import logging
+import math
 import threading
 import msgpack
 import os
@@ -298,6 +299,28 @@ def probe_audio_duration(audio_path: Path) -> float | None:
         return None
 
 
+def validate_voice_clone_sample_duration(duration: float | int | None) -> None:
+    if duration is None:
+        raise ValueError(
+            "Could not verify the audio duration. Please send a supported clip between "
+            f"{VOICE_CLONE_MIN_AUDIO_SECONDS} and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
+        )
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        seconds = float("nan")
+    if not math.isfinite(seconds):
+        raise ValueError(
+            "Could not verify the audio duration. Please send a supported clip between "
+            f"{VOICE_CLONE_MIN_AUDIO_SECONDS} and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
+        )
+    if not VOICE_CLONE_MIN_AUDIO_SECONDS <= seconds <= VOICE_CLONE_MAX_AUDIO_SECONDS:
+        raise ValueError(
+            f"Please send a clip between {VOICE_CLONE_MIN_AUDIO_SECONDS} and "
+            f"{VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
+        )
+
+
 def clear_voice_clone_session(user_data: dict) -> None:
     sample_path = user_data.pop("voice_clone_sample_path", None)
     for key in (
@@ -559,6 +582,12 @@ def tts_failure_message(exc: Exception) -> str:
         if exc.status_code == 400:
             return "The provider rejected this sample or request. Use a clear, single-speaker clip of at least 10 seconds in MP3, WAV, M4A, or Opus format."
         return "The voice-cloning API request failed. Please check the provider settings and try again."
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "The voice-cloning provider timed out. Try shorter text or retry in a few minutes."
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "Could not connect to the voice-cloning provider. Please try again in a few minutes."
+    if isinstance(exc, requests.exceptions.RequestException):
+        return "The voice-cloning provider request failed. Please try again in a few minutes."
     if isinstance(exc, GeminiTTSAPIError):
         if exc.status_code == 429:
             return (
@@ -662,11 +691,12 @@ async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if attachment.file_size and attachment.file_size > max_bytes:
         await message.reply_text(f"That file is too large. The current limit is {VOICE_CLONE_MAX_UPLOAD_MB} MB.")
         return
-    if duration is not None and not VOICE_CLONE_MIN_AUDIO_SECONDS <= duration <= VOICE_CLONE_MAX_AUDIO_SECONDS:
-        await message.reply_text(
-            f"Please send a clip between {VOICE_CLONE_MIN_AUDIO_SECONDS} and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
-        )
-        return
+    if duration is not None:
+        try:
+            validate_voice_clone_sample_duration(duration)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
 
     temp_dir = Path(tempfile.mkdtemp(prefix="telegram-clone-upload-"))
     source_path = temp_dir / upload_name
@@ -680,11 +710,8 @@ async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             raise RuntimeError("Telegram returned an empty audio file")
         if source_path.stat().st_size > max_bytes:
             raise ValueError(f"The downloaded file exceeds the {VOICE_CLONE_MAX_UPLOAD_MB} MB limit")
-        measured_duration = duration if duration is not None else await asyncio.to_thread(probe_audio_duration, source_path)
-        if measured_duration is not None and not VOICE_CLONE_MIN_AUDIO_SECONDS <= measured_duration <= VOICE_CLONE_MAX_AUDIO_SECONDS:
-            raise ValueError(
-                f"Please send a clip between {VOICE_CLONE_MIN_AUDIO_SECONDS} and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long"
-            )
+        measured_duration = await asyncio.to_thread(probe_audio_duration, source_path)
+        validate_voice_clone_sample_duration(measured_duration)
         await asyncio.to_thread(transcode_clone_sample, source_path, sample_path)
         source_path.unlink(missing_ok=True)
         clear_voice_clone_session(context.user_data)
@@ -813,38 +840,74 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     clone_sample_path = context.user_data.get("voice_clone_sample_path")
     clone_transcript = context.user_data.get("voice_clone_transcript")
     if clone_sample_path and clone_transcript:
+        if len(text) > MAX_TEXT_LENGTH:
+            await update.message.reply_text(
+                f"Text is too long ({len(text)} characters). Maximum limit is {MAX_TEXT_LENGTH}."
+            )
+            return
         sample_path = Path(clone_sample_path)
         if not sample_path.exists():
             clear_voice_clone_session(context.user_data)
             await update.message.reply_text("The temporary voice sample has expired. Start again with /clonevoice.")
             return
-        spoken_text = " ".join(segment_text for _, segment_text in parse_script(text))
         status_message = await update.message.reply_text(
             f"Generating speech with your private cloned voice... {progress_bar(5)}"
         )
-        progress_task = asyncio.create_task(animate_progress(status_message, "Generating cloned-voice audio"))
+        progress_task = None
         audio_path = None
+        voice_note_path = None
+        voice_note_sent = False
         try:
+            spoken_text = " ".join(
+                segment_text for _, segment_text, _ in parse_script(text)
+            ).strip()
+            if not spoken_text:
+                raise ValueError("Please send non-empty text to synthesize.")
+            progress_task = asyncio.create_task(
+                animate_progress(status_message, "Generating cloned-voice audio")
+            )
             await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             audio_path = await asyncio.to_thread(
                 compile_cloned_voice_to_mp3, spoken_text, sample_path, clone_transcript, current_speed
             )
             progress_task.cancel()
             await asyncio.gather(progress_task, return_exceptions=True)
+            try:
+                voice_note_path = await asyncio.to_thread(convert_to_voice_note, audio_path)
+            except Exception:
+                logger.exception("Could not convert cloned MP3 to a Telegram voice note; sending the MP3 only.")
+            if voice_note_path:
+                try:
+                    with voice_note_path.open("rb") as voice_note_file:
+                        await update.message.reply_voice(
+                            voice=voice_note_file,
+                            caption="Speech generated with your cloned voice",
+                        )
+                    voice_note_sent = True
+                except Exception:
+                    logger.exception("Could not deliver cloned voice note; sending the MP3 document instead.")
             with audio_path.open("rb") as audio_file:
                 await update.message.reply_document(
                     document=audio_file,
                     filename="cloned-voiceover.mp3",
                     caption="Speech generated with your cloned voice",
                 )
-            await status_message.edit_text(f"Cloned voiceover ready... {progress_bar(100)}")
+            if voice_note_sent:
+                await status_message.edit_text(f"Cloned voiceover ready... {progress_bar(100)}")
+            else:
+                await status_message.edit_text(
+                    f"Cloned MP3 sent. Telegram voice-note format was unavailable... {progress_bar(100)}"
+                )
         except Exception as exc:
-            progress_task.cancel()
-            await asyncio.gather(progress_task, return_exceptions=True)
-            logger.warning("Cloned-voice synthesis failed: %s", type(exc).__name__)
-            detail = str(exc) if isinstance(exc, ValueError) else tts_failure_message(exc)
+            if progress_task:
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+            if isinstance(exc, VoiceCloneAPIError):
+                logger.exception("Cloned-voice synthesis failed with HTTP %s.", exc.status_code)
+            else:
+                logger.exception("Cloned-voice synthesis failed (%s).", type(exc).__name__)
             await status_message.edit_text(
-                f"Cloned-voice generation failed... {progress_bar(100)}\n{detail}"
+                f"Cloned-voice generation failed... {progress_bar(100)}\n{tts_failure_message(exc)}"
             )
         finally:
             if audio_path:
