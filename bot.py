@@ -1,5 +1,6 @@
 import base64
 import asyncio
+import html
 import json
 import logging
 import math
@@ -105,6 +106,40 @@ VOICES = {
     name: {"gender": gender, "tone": tone, "description": f"{tone} Gemini voice"}
     for name, gender, tone in VOICE_CATALOG
 }
+VOICE_GUIDES = {
+    "Achernar": "နူးညံ့သိမ်မွေ့သောအသံဖြစ်၍ စိတ်ခံစားမှုအသားပေး အကျဉ်းချုပ်များနှင့် မိသားစုဒရာမာများအတွက် သင့်တော်သည်။",
+    "Achird": "ရင်းနှီးဖော်ရွေသော အသံအရည်အသွေးကြောင့် ရုပ်ရှင်အကျဉ်းချုပ်ပြောပြခြင်းနှင့် ဒရာမာဇာတ်လမ်းများအတွက် သင့်တော်သည်။",
+    "Algenib": "အသံမှာ ကြမ်းရှရှ အရည်အသွေးရှိပြီး သည်းထိတ်ရင်ဖိုနှင့် အက်ရှင်ဇာတ်ကားများ၏ အကျဉ်းချုပ်ပြောပြမှုနှင့် လိုက်ဖက်သည်။",
+    "Algieba": "ချောမွေ့သော အသံအရည်အသွေးက ရုပ်ရှင်အကျဉ်းချုပ်များနှင့် ဒရာမာဇာတ်လမ်းများကို ပြောပြရာတွင် သင့်တော်သည်။",
+    "Alnilam": "အသံတည်ကြည်ခိုင်မာသောကြောင့် လှုပ်ရှားမှုနှင့် သည်းထိတ်ရင်ဖိုဇာတ်ကားများ၏ အကျဉ်းချုပ်ပြောပြရာတွင် သင့်တော်သည်။",
+    "Aoede": "ပေါ့ပါးလန်းဆန်းသောအသံဖြင့် ဟာသနှင့် စွန့်စားခန်းရုပ်ရှင်အကျဉ်းချုပ်များကို တင်ဆက်ရန် သင့်တော်သည်။",
+    "Autonoe": "တောက်ပကြည်လင်သော အသံအရည်အသွေးက ရုပ်ရှင်ဇာတ်လမ်းအကျဉ်းချုပ်နှင့် စွန့်စားခန်းဇာတ်ကားများကို ပြောပြရာတွင် သင့်တော်သည်။",
+    "Callirrhoe": "အေးအေးဆေးဆေး သက်တောင့်သက်သာရှိသောအသံဖြစ်၍ ဟာသနှင့် နေ့စဉ်ဘဝဇာတ်လမ်းများအတွက် သင့်တော်သည်။",
+    "Charon": "အချက်အလက်ကို ရှင်းလင်းတင်ပြသည့်အသံဖြစ်၍ ရုပ်ရှင်အကျဉ်းချုပ်နှင့် စုံထောက်ဇာတ်လမ်းများအတွက် သင့်တော်သည်။",
+    "Despina": "အသံချောမွေ့သဖြင့် ဇာတ်လမ်းအကျဉ်းချုပ်ပြောပြမှုနှင့် ဒရာမာ၊ စုံထောက်ဇာတ်ကားများအတွက် သင့်တော်သည်။",
+    "Enceladus": "အသက်ရှူသံပါသလို နူးညံ့သောအသံက သည်းထိတ်ရင်ဖိုနှင့် ဒရာမာဇာတ်လမ်းများကို ပြောပြရန် လိုက်ဖက်သည်။",
+    "Erinome": "အသံထွက်ရှင်းလင်းပြီး နားလည်လွယ်သဖြင့် ရုပ်ရှင်အကျဉ်းချုပ်ပြောပြရာနှင့် စုံထောက်ဇာတ်ကားများအတွက် သင့်လျော်သည်။",
+    "Fenrir": "စိတ်လှုပ်ရှားတက်ကြွသည့် အသံကြောင့် တိုက်ခိုက်ရေးနှင့် စွန့်စားခန်းဇာတ်ကားများကို အကျဉ်းချုပ်ပြောပြရာတွင် လိုက်ဖက်သည်။",
+    "Gacrux": "ရင့်ကျက်သောအသံအရည်အသွေးကြောင့် ဇာတ်လမ်းပြန်လည်ပြောပြမှုနှင့် ဒရာမာဆန်သော ရုပ်ရှင်ဇာတ်လမ်းများအတွက် သင့်တော်သည်။",
+    "Iapetus": "အသံကြည်လင်ပြတ်သားသဖြင့် အက်ရှင်နှင့် စုံထောက်ဇာတ်လမ်းများ၏ အကျဉ်းချုပ်ပြောပြရာတွင် သင့်တော်သည်။",
+    "Kore": "ခိုင်မာပြတ်သားသောအသံဖြင့် စုံထောက်နှင့် သည်းထိတ်ရင်ဖိုဇာတ်ကားများကို ရှင်းလင်းတင်ပြရန် သင့်တော်သည်။",
+    "Laomedeia": "တက်ကြွပျော်ရွှင်သောအသံက ဟာသနှင့် စွန့်စားခန်းဇာတ်ကားအကျဉ်းချုပ်များကို စိတ်ဝင်စားဖွယ် တင်ဆက်ရန် သင့်တော်သည်။",
+    "Leda": "လူငယ်ဆန်သောအသံဖြစ်၍ လူငယ်အချစ်ဇာတ်လမ်းနှင့် အရွယ်ရောက်လာမှုဇာတ်ကားများအတွက် သင့်တော်သည်။",
+    "Orus": "ခိုင်မာပြတ်သားသော အသံအရည်အသွေးဖြင့် အက်ရှင်နှင့် သည်းထိတ်ရင်ဖိုဇာတ်ကားများ၏ အကျဉ်းချုပ်ကို ပြောပြရန် သင့်တော်သည်။",
+    "Pulcherrima": "ရှေ့ထွက်ထင်ရှားသော အသံအရည်အသွေးကြောင့် ဇာတ်ကားအကျဉ်းချုပ်ပြောပြမှုနှင့် စွန့်စားခန်းဇာတ်ကားများအတွက် သင့်တော်သည်။",
+    "Puck": "တက်ကြွပျော်ရွှင်တဲ့ အသံအရောင်ကြောင့် ဟာသဇာတ်ကားနဲ့ စွန့်စားခန်းဇာတ်ကားတို့ရဲ့ အကျဉ်းချုပ်ပြောပြမှုမှာ သင့်တော်ပါတယ်။",
+    "Rasalgethi": "အချက်အလက်ကို ရှင်းလင်းနားလည်လွယ်စွာတင်ပြသည့်အသံကြောင့် မှုခင်းနှင့် သမိုင်းဇာတ်လမ်းအကျဉ်းချုပ်များအတွက် သင့်တော်သည်။",
+    "Sadachbia": "အသက်ဝင်တက်ကြွသော အသံကြောင့် ဟာသနှင့် စွန့်စားခန်းဇာတ်ကားများ၏ အကျဉ်းချုပ်ကို စိတ်ဝင်စားဖွယ် တင်ဆက်ပေးနိုင်သည်။",
+    "Sadaltager": "ဗဟုသုတပြည့်ဝသည့်အသံဖြင့် သမိုင်းနှင့် စုံထောက်ဇာတ်ကားများကို အကျဉ်းချုပ်ပြောပြရန် သင့်တော်သည်။",
+    "Schedar": "အသံအနေအထား တည်ငြိမ်ညီညာပြီး ဇာတ်လမ်းအကျဉ်းချုပ်နှင့် စုံထောက်ဇာတ်ကားများကို ပြောပြရာတွင် သင့်တော်သည်။",
+    "Sulafat": "နွေးထွေးသောအသံအရည်အသွေးက မိသားစုဒရာမာနှင့် အချစ်ဇာတ်လမ်းများ၏ အကျဉ်းချုပ်ပြောပြမှုကို နားထောင်ရသက်သာစေသည်။",
+    "Umbriel": "ပေါ့ပါးသက်သာသော အသံဖြင့် ဟာသနှင့် မိသားစုဇာတ်လမ်းများ၏ အကျဉ်းချုပ်ကို ပြောပြရန် သင့်တော်သည်။",
+    "Vindemiatrix": "နူးညံ့သိမ်မွေ့တဲ့ အသံကြောင့် ဒရာမာနဲ့ မိသားစုဇာတ်ကားတွေကို အကျဉ်းချုပ်ပြောပြရာမှာ သင့်တော်ပါတယ်။",
+    "Zephyr": "ကြည်လင်တောက်ပသောအသံက စိတ်လှုပ်ရှားဖွယ် အကျဉ်းချုပ်နှင့် စွန့်စားခန်းဇာတ်ကားများအတွက် သင့်တော်သည်။",
+    "Zubenelgenubi": "ပေါ့ပေါ့ပါးပါး သဘာဝကျတဲ့ အသံစီးဆင်းမှုကြောင့် ဟာသနှင့် နေ့စဉ်ဘဝဇာတ်ကားများ၏ အကျဉ်းချုပ်ကို ပြောပြရာတွင် သင့်တော်သည်။",
+}
+for voice_name, guide in VOICE_GUIDES.items():
+    VOICES[voice_name]["description"] = guide
 
 SPEEDS = {
     "very_slow": "Speak very slowly with clear pauses",
@@ -122,28 +157,37 @@ SPEED_LABELS = {
     "very_fast": "Very Fast",
 }
 
-STYLES = {
+STYLE_CATALOG = [
+    ("suspense_thriller", "Suspense & Thriller", "လျှို့ဝှက်ချက်နဲ့ စိတ်တင်းမာမှုများတဲ့ ဇာတ်ဝင်ခန်းများအတွက်။", "Build suspense with controlled pauses, tension, and a mysterious dramatic tone"),
+    ("dramatic_emotional", "Dramatic & Emotional", "ခံစားချက်ပြင်းထန်တဲ့ ဒရာမာနဲ့ ဇာတ်ကောင်အခိုက်အတန့်များအတွက်။", "Deliver expressive dramatic narration with emotional emphasis and measured pacing"),
+    ("fast_paced_recap", "Fast-Paced Recap", "အဖြစ်အပျက်များကို မြန်မြန်ဆန်ဆန် ပြန်လည်တင်ပြရန်။", "Speak briskly and clearly, keeping the recap energetic and easy to follow"),
+    ("action_energetic", "Action & Energetic", "တိုက်ခိုက်ခန်း၊ လိုက်လံခန်းနဲ့ အရှိန်မြင့်အခန်းများအတွက်။", "Use energetic, forceful delivery with dynamic emphasis for action scenes"),
+    ("funny_conversational", "Funny & Conversational", "ဟာသနှင့် ပေါ့ပေါ့ပါးပါး စကားပြောဟန်ရှိသော အခန်းများအတွက်။", "Use a light, conversational delivery with playful comic timing"),
+    ("dark_horror", "Dark & Horror", "ကြောက်မက်ဖွယ်၊ မှောင်မိုက်ပြီး စိတ်ခြောက်ခြားစေသော ဇာတ်လမ်းများအတွက်။", "Use a restrained, ominous, dark tone with deliberate pauses"),
+    ("burmese_street_talk", "Local Burmese Street-Talk", "မြန်မာစကားပြောဆန်ဆန်၊ သဘာဝကျတဲ့ Recap များအတွက်။", "Use natural conversational Burmese phrasing and an informal, approachable cadence"),
+    ("epic_cinematic_trailer", "Epic & Cinematic Trailer", "ကြီးကျယ်ခမ်းနားတဲ့ ဇာတ်ဝင်ခန်းနဲ့ Trailer ဟန်တင်ပြမှုအတွက်။", "Deliver grand cinematic narration that builds intensity and scale"),
+    ("soft_sad_nostalgic", "Soft & Sad / Nostalgic", "ဝမ်းနည်းနူးညံ့မှုနဲ့ အတိတ်အမှတ်တရများကို ပြန်ပြောရန်။", "Speak softly and gently with a wistful, nostalgic emotional tone"),
+    ("satirical_sarcastic", "Satirical & Sarcastic", "သရော်ဟန်၊ ခပ်ရွဲ့ရွဲ့ ဟာသပါသော ဇာတ်ကြောင်းများအတွက်။", "Use dry, satirical delivery with subtle sarcastic emphasis"),
+]
+STYLES = {key: prompt for key, _, _, prompt in STYLE_CATALOG}
+STYLE_NAMES = {key: label for key, label, _, _ in STYLE_CATALOG}
+STYLE_HINTS = {key: hint for key, _, hint, _ in STYLE_CATALOG}
+
+# Accept legacy DEFAULT_STYLE values at startup and in direct request-builder tests.
+LEGACY_STYLE_PROMPTS = {
     "neutral": "Read naturally without exaggerated emotion",
     "cheerful": "Read with a warm, cheerful, and upbeat tone",
     "dramatic": "Read with dramatic pacing, emotion, and emphasis",
     "news": "Read like a professional news broadcaster",
     "storytelling": "Read like a captivating narrator telling a story",
 }
-
-STYLE_NAMES = {
-    "neutral": "Natural / Neutral",
-    "cheerful": "Cheerful & Upbeat",
-    "dramatic": "Dramatic & Emotional",
-    "news": "News Broadcaster",
-    "storytelling": "Storytelling Narrator",
-}
-
-STYLE_PROMPTS = {
-    "neutral": "Natural speech style",
-    "cheerful": "Upbeat and enthusiastic tone",
-    "dramatic": "Expressive and dramatic tone",
-    "news": "Clear and authoritative news style",
-    "storytelling": "Engaging storytelling tone",
+STYLE_PROMPTS = {**STYLES, **LEGACY_STYLE_PROMPTS}
+LEGACY_STYLE_ALIASES = {
+    "neutral": "fast_paced_recap",
+    "cheerful": "funny_conversational",
+    "dramatic": "dramatic_emotional",
+    "news": "fast_paced_recap",
+    "storytelling": "dramatic_emotional",
 }
 
 VOICE_MODES = {
@@ -153,7 +197,11 @@ VOICE_MODES = {
 
 current_voice = DEFAULT_VOICE if DEFAULT_VOICE in VOICES else "Kore"
 current_speed = DEFAULT_SPEED if DEFAULT_SPEED in SPEEDS else "normal"
-current_style = DEFAULT_STYLE if DEFAULT_STYLE in STYLES else "neutral"
+current_style = (
+    DEFAULT_STYLE
+    if DEFAULT_STYLE in STYLES
+    else LEGACY_STYLE_ALIASES.get(DEFAULT_STYLE, "dramatic_emotional")
+)
 current_voice_mode = DEFAULT_VOICE_MODE if DEFAULT_VOICE_MODE in VOICE_MODES else "single"
 
 
@@ -206,7 +254,7 @@ def welcome_text() -> str:
         f"Current Voice: {current_voice} ({VOICES[current_voice]['gender']}, {VOICES[current_voice]['tone']})\n"
         f"Voice mode: {VOICE_MODES[current_voice_mode]}\n"
         f"Current speed: {SPEED_LABELS[current_speed]}\n\n"
-        f"Current style: {STYLE_NAMES[current_style]}\n\n"
+        f"Current style: {html.escape(STYLE_NAMES[current_style])}\n\n"
         "Choose a setting below, then send me any text.\n\n"
         "Optional voice cloning: /clonevoice, then send a short audio sample. Use /cancelclone to return to Gemini TTS."
     )
@@ -237,6 +285,52 @@ def voice_keyboard() -> InlineKeyboardMarkup:
     rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
+
+
+def voice_menu_text() -> str:
+    return (
+        f"Gemini အသံ {len(VOICE_CATALOG)} မျိုးထဲမှ ရွေးပါ။\n"
+        f"လက်ရှိရွေးထားသောအသံ: <b>{current_voice}</b> ({VOICES[current_voice]['gender']})\n"
+        "အသံနမူနာကို အသံတစ်ခုကို နှိပ်ရွေးသည့်အခါမှသာ ဖန်တီးပေးပါမည်။"
+    )
+
+
+def style_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✓ ' if key == current_style else ''}{label}",
+            callback_data=f"style:{key}",
+        )
+        for key, label, _, _ in STYLE_CATALOG
+    ]
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("« Back to Main Menu", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def style_menu_text() -> str:
+    lines = [
+        f"<b>Movie voiceover styles</b>\nလက်ရှိရွေးထားသောပုံစံ: <b>{html.escape(STYLE_NAMES[current_style])}</b>",
+        STYLE_HINTS[current_style],
+        "",
+        "အသုံးပြုမည့်ဟန်ကို ရွေးပါ:",
+    ]
+    lines.extend(f"• {html.escape(label)} — {hint}" for _, label, hint, _ in STYLE_CATALOG)
+    return "\n".join(lines)
+
+
+def voice_selection_text(voice: str) -> str:
+    return (
+        f"ရွေးထားသောအသံ: <b>{voice}</b> ({VOICES[voice]['gender']})။\n\n"
+        f"{VOICE_GUIDES[voice]}"
+    )
+
+
+def style_selection_text(style: str) -> str:
+    return (
+        f"အသံတင်ဆက်ပုံစံကို <b>{html.escape(STYLE_NAMES[style])}</b> သို့ ပြောင်းထားသည်။\n"
+        f"{STYLE_HINTS[style]}"
+    )
 
 
 class GeminiTTSAPIError(RuntimeError):
@@ -751,6 +845,86 @@ def convert_to_voice_note(mp3_path: Path) -> Path:
     return ogg_path
 
 
+VOICE_PREVIEW_TEXT = "မင်္ဂလာပါ၊ ဒီအသံနဲ့ မြန်မာ Movie Recap ကို နားထောင်ကြည့်ပါ။"
+
+
+def _convert_preview_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path),
+            "-vn", "-c:a", "libmp3lame", "-b:a", "128k", str(mp3_path),
+        ],
+        check=True,
+        timeout=30,
+    )
+    if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+        raise RuntimeError("Preview conversion produced an empty MP3")
+
+
+async def send_voice_preview(message, voice: str) -> None:
+    """Synthesize one short preview for an explicitly selected voice."""
+    preview_dir = Path(tempfile.mkdtemp(prefix="gemini-voice-preview-"))
+    wav_path = preview_dir / "voice-preview.wav"
+    mp3_path = preview_dir / f"{voice}-burmese-preview.mp3"
+    status = await message.reply_text(f"{voice} Burmese voice preview is generating…")
+    try:
+        # Reuse the ordinary Gemini model/fallback/retry path with snapshots only.
+        preview_speed = current_speed
+        preview_style = current_style
+        wav_bytes = await asyncio.to_thread(
+            generate_audio_segment,
+            VOICE_PREVIEW_TEXT,
+            voice,
+            preview_speed,
+            preview_style,
+        )
+        wav_path.write_bytes(wav_bytes)
+        await asyncio.to_thread(_convert_preview_wav_to_mp3, wav_path, mp3_path)
+
+        voice_note_path = None
+        try:
+            voice_note_path = await asyncio.to_thread(convert_to_voice_note, mp3_path)
+        except Exception as exc:
+            logger.info("Preview voice-note conversion unavailable (%s); using MP3 fallback.", type(exc).__name__)
+
+        sent_voice_note = False
+        if voice_note_path:
+            try:
+                with voice_note_path.open("rb") as audio_file:
+                    await message.reply_voice(
+                        voice=audio_file,
+                        caption=f"{voice} Burmese voice preview",
+                    )
+                sent_voice_note = True
+            except Exception as exc:
+                logger.info("Preview voice-note delivery unavailable (%s); using MP3 fallback.", type(exc).__name__)
+
+        if not sent_voice_note:
+            try:
+                with mp3_path.open("rb") as audio_file:
+                    if not hasattr(message, "reply_audio"):
+                        raise AttributeError("Audio attachments are unavailable")
+                    await message.reply_audio(
+                        audio=audio_file,
+                        title=f"{voice} Burmese voice preview",
+                        caption=f"{voice} Burmese voice preview",
+                    )
+            except Exception as exc:
+                logger.info("Preview audio delivery unavailable (%s); using MP3 document fallback.", type(exc).__name__)
+                with mp3_path.open("rb") as audio_file:
+                    await message.reply_document(
+                        document=audio_file,
+                        filename=mp3_path.name,
+                        caption=f"{voice} Burmese voice preview",
+                    )
+        await status.edit_text(f"{voice} voice preview sent.")
+    except Exception as exc:
+        logger.warning("Gemini voice preview failed (%s).", type(exc).__name__)
+        await status.edit_text("အသံနမူနာကို ယခုဖန်တီးမရသေးပါ။ ခဏကြာပြီး ပြန်စမ်းကြည့်ပါ။")
+    finally:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+
+
 def tts_failure_message(exc: Exception) -> str:
     if isinstance(exc, VoiceCloneConfigurationError):
         return "Voice cloning is not configured. Add VOICE_CLONE_API_KEY (or FISH_API_KEY) in Render Environment; do not send API keys in Telegram."
@@ -811,8 +985,21 @@ async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if update.message:
         await update.message.reply_text(
-            f"Select a Gemini voice ({len(VOICE_CATALOG)} prebuilt voices):",
+            voice_menu_text(),
             reply_markup=voice_keyboard(),
+            parse_mode="HTML",
+        )
+
+
+async def setstyle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await reject_unauthorized(update)
+        return
+    if update.message:
+        await update.message.reply_text(
+            style_menu_text(),
+            reply_markup=style_keyboard(),
+            parse_mode="HTML",
         )
 
 
@@ -933,7 +1120,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("Unauthorized user.")
         return
 
-    data = query.data
+    data = query.data or ""
     if data == "menu:main":
         await query.edit_message_text(
             welcome_text(),
@@ -942,18 +1129,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     elif data == "menu:voice":
         await query.edit_message_text(
-            f"Select a Gemini voice ({len(VOICE_CATALOG)} prebuilt voices):",
+            voice_menu_text(),
             reply_markup=voice_keyboard(),
+            parse_mode="HTML",
         )
     elif data.startswith("voice:"):
-        v_name = data.split(":")[1]
-        if v_name in VOICES:
+        v_name = data.removeprefix("voice:")
+        if v_name in VOICES and data == f"voice:{v_name}":
             current_voice = v_name
             await query.edit_message_text(
-                f"Voice changed to <b>{current_voice}</b>.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
-                parse_mode="HTML"
+                voice_selection_text(v_name),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("« Back to Voices", callback_data="menu:voice")],
+                    [InlineKeyboardButton("« Back to Main Menu", callback_data="menu:main")],
+                ]),
+                parse_mode="HTML",
             )
+            if query.message:
+                await send_voice_preview(query.message, v_name)
+        else:
+            await _show_invalid_callback(query)
     elif data == "menu:speed":
         keyboard = []
         for spd_key, spd_label in SPEED_LABELS.items():
@@ -962,46 +1157,66 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         keyboard.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
         await query.edit_message_text("Select speed:", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data.startswith("speed:"):
-        spd_key = data.split(":")[1]
-        if spd_key in SPEEDS:
+        spd_key = data.removeprefix("speed:")
+        if spd_key in SPEEDS and data == f"speed:{spd_key}":
             current_speed = spd_key
             await query.edit_message_text(
                 f"Speed changed to <b>{SPEED_LABELS[current_speed]}</b>.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
                 parse_mode="HTML"
             )
+        else:
+            await _show_invalid_callback(query)
     elif data == "menu:style":
-        keyboard = []
-        for st_key, st_name in STYLE_NAMES.items():
-            prefix = "✓ " if st_key == current_style else ""
-            keyboard.append([InlineKeyboardButton(f"{prefix}{st_name}", callback_data=f"style:{st_key}")])
-        keyboard.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
-        await query.edit_message_text("Select voice style:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            style_menu_text(),
+            reply_markup=style_keyboard(),
+            parse_mode="HTML",
+        )
     elif data.startswith("style:"):
-        st_key = data.split(":")[1]
-        if st_key in STYLES:
+        st_key = data.removeprefix("style:")
+        if st_key in STYLE_NAMES and data == f"style:{st_key}":
             current_style = st_key
             await query.edit_message_text(
-                f"Style changed to <b>{STYLE_NAMES[current_style]}</b>.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
-                parse_mode="HTML"
+                style_selection_text(current_style),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("« Back to Styles", callback_data="menu:style")],
+                    [InlineKeyboardButton("« Back to Main Menu", callback_data="menu:main")],
+                ]),
+                parse_mode="HTML",
             )
+        else:
+            await _show_invalid_callback(query)
     elif data == "menu:mode":
         keyboard = [
-            [InlineKeyboardButton("Single Speaker", callback_data="mode:single")],
-            [InlineKeyboardButton("Multi-Speaker (Script)", callback_data="mode:multi")],
+            [InlineKeyboardButton(f"{'✓ ' if current_voice_mode == 'single' else ''}Single Speaker", callback_data="mode:single")],
+            [InlineKeyboardButton(f"{'✓ ' if current_voice_mode == 'multi' else ''}Multi-Speaker (Script)", callback_data="mode:multi")],
             [InlineKeyboardButton("« Back", callback_data="menu:main")],
         ]
         await query.edit_message_text("Select voice mode:", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data.startswith("mode:"):
-        mode_key = data.split(":")[1]
-        if mode_key in VOICE_MODES:
+        mode_key = data.removeprefix("mode:")
+        if mode_key in VOICE_MODES and data == f"mode:{mode_key}":
             current_voice_mode = mode_key
             await query.edit_message_text(
                 f"Voice mode changed to <b>{VOICE_MODES[current_voice_mode]}</b>.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
                 parse_mode="HTML"
             )
+        else:
+            await _show_invalid_callback(query)
+    else:
+        await _show_invalid_callback(query)
+
+
+async def _show_invalid_callback(query) -> None:
+    try:
+        await query.edit_message_text(
+            "ရွေးချယ်မှု မမှန်ကန်ပါ။ မီနူးကို ပြန်ဖွင့်ပြီး ထပ်ရွေးပါ။",
+            reply_markup=settings_keyboard(),
+        )
+    except Exception:
+        logger.info("Could not refresh an expired or invalid menu callback.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1248,6 +1463,7 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setvoice", setvoice_command))
+    application.add_handler(CommandHandler("setstyle", setstyle_command))
     application.add_handler(CommandHandler("setspeed", setspeed_command))
     application.add_handler(CommandHandler("clonevoice", clonevoice_command))
     application.add_handler(CommandHandler("cancelclone", cancelclone_command))
