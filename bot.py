@@ -189,6 +189,12 @@ class GeminiTTSAPIError(RuntimeError):
         super().__init__(f"Gemini TTS API error {status_code} for {model}: {body[:1000]}")
 
 
+class GeminiTTSRequestError(RuntimeError):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Gemini TTS request {reason}")
+
+
 class VoiceCloneAPIError(RuntimeError):
     def __init__(self, status_code: int):
         self.status_code = status_code
@@ -360,31 +366,84 @@ def clone_audio_attachment(message):
     return attachment, f"voice-sample{safe_suffix}", duration, None
 
 
-def _generate_audio_base64(text: str, voice: str, model: str, speed: str, style: str) -> str:
+def _build_gemini_tts_payload(
+    text: str, voice: str, speed: str, style: str, model: str
+) -> dict:
     delivery = f"{STYLE_PROMPTS[style]}; {SPEEDS[speed]}"
-    payload = {
+    return {
         "model": model,
-        "input": text,
-        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
-        "delivery_instruction": delivery,
+        "input": [
+            {
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text,
+                        "annotations": [
+                            {"type": "speech_metadata", "style": delivery}
+                        ],
+                    }
+                ],
+            }
+        ],
+        "response_format": {
+            "type": "audio",
+            "mime_type": "audio/l16",
+            "sample_rate": 24000,
+        },
+        "generation_config": {"speech_config": [{"voice": voice}]},
     }
 
-    url = f"{GEMINI_INTERACTIONS_URL}?key={GEMINI_API_KEY}"
-    res = requests.post(url, json=payload, timeout=60)
+
+def _extract_interaction_audio_base64(data: dict) -> str | None:
+    output_audio = data.get("output_audio")
+    if isinstance(output_audio, dict) and isinstance(output_audio.get("data"), str):
+        return output_audio["data"]
+
+    steps = data.get("steps", [])
+    if not isinstance(steps, list):
+        return None
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        content = step.get("content", [])
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("data"), str):
+                return block["data"]
+    return None
+
+
+def _generate_audio_base64(text: str, voice: str, model: str, speed: str, style: str) -> str:
+    payload = _build_gemini_tts_payload(text, voice, speed, style, model)
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    try:
+        res = requests.post(
+            GEMINI_INTERACTIONS_URL, headers=headers, json=payload, timeout=60
+        )
+    except requests.exceptions.Timeout as exc:
+        raise GeminiTTSRequestError("timed out") from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise GeminiTTSRequestError("could not connect") from exc
+    except requests.exceptions.RequestException as exc:
+        raise GeminiTTSRequestError("failed due to a network error") from exc
     if not res.ok:
         raise GeminiTTSAPIError(res.status_code, model, res.text)
 
-    data = res.json()
     try:
-        candidates = data.get("candidates", [])
-        parts = candidates[0]["content"]["parts"]
-        for part in parts:
-            if "inlineData" in part and "data" in part["inlineData"]:
-                return part["inlineData"]["data"]
-    except (IndexError, KeyError, TypeError) as e:
-        raise RuntimeError(f"Unexpected API response structure from Gemini ({model}): {data}") from e
+        data = res.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Gemini returned an invalid JSON response ({model}).") from exc
 
-    raise RuntimeError(f"No audio inlineData returned in API response from Gemini ({model}).")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected API response structure from Gemini ({model}).")
+    audio_data = _extract_interaction_audio_base64(data)
+    if audio_data:
+        return audio_data
+    raise RuntimeError(f"No audio data returned in Gemini Interactions response ({model}).")
 
 
 def generate_audio_segment(text: str, voice: str, speed: str, style: str) -> bytes:
@@ -568,6 +627,8 @@ def convert_to_voice_note(mp3_path: Path) -> Path:
 def tts_failure_message(exc: Exception) -> str:
     if isinstance(exc, VoiceCloneConfigurationError):
         return "Voice cloning is not configured. Add VOICE_CLONE_API_KEY (or FISH_API_KEY) in Render Environment; do not send API keys in Telegram."
+    if isinstance(exc, GeminiTTSRequestError):
+        return f"Gemini TTS request {exc.reason}. Please try again in a few minutes."
     if isinstance(exc, VoiceCloneAPIError):
         if exc.status_code in {401, 403}:
             return "The voice-cloning API key is missing, invalid, or lacks access. Check VOICE_CLONE_API_KEY in Render Environment."
@@ -595,6 +656,11 @@ def tts_failure_message(exc: Exception) -> str:
                 "Suggestions:\n"
                 "• Wait a minute and try again.\n"
                 "• Check your Google AI Studio quota limits."
+            )
+        if exc.status_code == 400:
+            return (
+                "Gemini rejected the text-to-speech request (HTTP 400). "
+                "Please retry; if it repeats, contact the bot owner."
             )
         return f"Gemini API returned error code {exc.status_code}."
     return f"Failed to generate speech: {str(exc)}"
