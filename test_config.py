@@ -20,7 +20,8 @@ if not configured_ids or any(not value.isdigit() or int(value) <= 0 for value in
 
 import bot  # noqa: E402
 
-assert {"Aoede", "Charon", "Fenrir", "Kore", "Puck"} <= set(bot.VOICES)
+assert len(bot.VOICES) == 30
+assert {"Achernar", "Achird", "Kore", "Puck", "Zubenelgenubi"} <= set(bot.VOICES)
 assert set(bot.VOICE_MODES) == {"single", "multi"}
 assert set(bot.SPEEDS) == set(bot.SPEED_LABELS)
 assert bot.ALLOWED_TELEGRAM_USER_IDS

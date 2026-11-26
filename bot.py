@@ -11,6 +11,7 @@ import subprocess
 import shutil
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
@@ -67,12 +68,42 @@ VOICE_CLONE_MAX_AUDIO_SECONDS = max(
 VOICE_CLONE_SPEEDS = {"very_slow": 0.75, "normal": 1.0, "fast": 1.25, "very_fast": 1.5}
 VOICE_CLONE_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".opus", ".ogg", ".oga"}
 
+VOICE_CATALOG = [
+    ("Achernar", "Female", "Soft"),
+    ("Achird", "Male", "Friendly"),
+    ("Algenib", "Male", "Gravelly"),
+    ("Algieba", "Male", "Smooth"),
+    ("Alnilam", "Male", "Firm"),
+    ("Aoede", "Female", "Breezy"),
+    ("Autonoe", "Female", "Bright"),
+    ("Callirrhoe", "Female", "Easy-going"),
+    ("Charon", "Male", "Informative"),
+    ("Despina", "Female", "Smooth"),
+    ("Enceladus", "Male", "Breathy"),
+    ("Erinome", "Female", "Clear"),
+    ("Fenrir", "Male", "Excitable"),
+    ("Gacrux", "Female", "Mature"),
+    ("Iapetus", "Male", "Clear"),
+    ("Kore", "Female", "Firm"),
+    ("Laomedeia", "Female", "Upbeat"),
+    ("Leda", "Female", "Youthful"),
+    ("Orus", "Male", "Firm"),
+    ("Pulcherrima", "Female", "Forward"),
+    ("Puck", "Male", "Upbeat"),
+    ("Rasalgethi", "Male", "Informative"),
+    ("Sadachbia", "Male", "Lively"),
+    ("Sadaltager", "Male", "Knowledgeable"),
+    ("Schedar", "Male", "Even"),
+    ("Sulafat", "Female", "Warm"),
+    ("Umbriel", "Male", "Easy-going"),
+    ("Vindemiatrix", "Female", "Gentle"),
+    ("Zephyr", "Female", "Bright"),
+    ("Zubenelgenubi", "Male", "Casual"),
+]
+VOICE_NAMES = {name for name, _, _ in VOICE_CATALOG}
 VOICES = {
-    "Puck": {"gender": "Male", "tone": "Upbeat", "description": "Enthusiastic and clear"},
-    "Charon": {"gender": "Male", "tone": "Deep", "description": "Authoritative and calm"},
-    "Kore": {"gender": "Female", "tone": "Relaxed", "description": "Warm and natural"},
-    "Fenrir": {"gender": "Male", "tone": "Intense", "description": "Strong and energetic"},
-    "Aoede": {"gender": "Female", "tone": "Melodic", "description": "Expressive and smooth"},
+    name: {"gender": gender, "tone": tone, "description": f"{tone} Gemini voice"}
+    for name, gender, tone in VOICE_CATALOG
 }
 
 SPEEDS = {
@@ -143,11 +174,25 @@ def progress_bar(percent: int) -> str:
     return f"[{'█' * filled}{'░' * (10 - filled)}] {percent}%"
 
 
-async def animate_progress(message, base_text: str):
-    steps = [15, 35, 60, 80, 95]
+async def animate_progress(message, base_text: str, progress_state=None, progress_lock=None):
+    percent = 5
     try:
-        for percent in steps:
+        while percent < 90:
             await asyncio.sleep(1.2)
+            if progress_state is not None and progress_lock is not None:
+                with progress_lock:
+                    completed = progress_state["completed"]
+                    total = progress_state["total"]
+                if total:
+                    completed_goal = 5 + round(80 * completed / total)
+                    next_segment_cap = (
+                        5 + round(80 * (completed + 1) / total) - 1
+                        if completed < total
+                        else 90
+                    )
+                    percent = min(next_segment_cap, max(completed_goal, percent + 1))
+            else:
+                percent = min(90, percent + 5)
             await message.edit_text(f"{base_text}... {progress_bar(percent)}")
     except asyncio.CancelledError:
         pass
@@ -179,6 +224,19 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def voice_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✓ ' if name == current_voice else ''}{name} ({gender[0]})",
+            callback_data=f"voice:{name}",
+        )
+        for name, gender, _ in VOICE_CATALOG
+    ]
+    rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
 
 
 class GeminiTTSAPIError(RuntimeError):
@@ -386,11 +444,7 @@ def _build_gemini_tts_payload(
                 ],
             }
         ],
-        "response_format": {
-            "type": "audio",
-            "mime_type": "audio/l16",
-            "sample_rate": 24000,
-        },
+        "response_format": {"type": "audio"},
         "generation_config": {"speech_config": [{"voice": voice}]},
     }
 
@@ -481,129 +535,202 @@ def generate_audio_segment(text: str, voice: str, speed: str, style: str) -> byt
     raise RuntimeError("Failed to generate audio segment.")
 
 
+def _safe_unicode_cut(text: str, max_length: int) -> int:
+    """Choose a chunk boundary that does not strand Burmese combining marks."""
+    cut = min(max_length, len(text))
+    while cut > 0 and cut < len(text) and (
+        unicodedata.category(text[cut]).startswith("M")
+        or text[cut] == "\u200d"
+        or text[cut - 1] in {"\u1039", "\u200d"}
+    ):
+        cut -= 1
+    if cut == 0:
+        cut = min(max_length, len(text))
+        while cut < len(text) and (
+            unicodedata.category(text[cut]).startswith("M")
+            or text[cut] == "\u200d"
+            or text[cut - 1] in {"\u1039", "\u200d"}
+        ):
+            cut += 1
+    return cut
+
+
 def split_text_for_tts(text: str, max_chunk_len: int = 800) -> list[str]:
-    lines = text.split("\n")
-    chunks = []
-    current_chunk = ""
+    """Split text at Burmese/Latin sentence, word, or safe Unicode boundaries."""
+    if max_chunk_len < 1:
+        raise ValueError("max_chunk_len must be positive")
+    text = text.strip()
+    if not text:
+        return []
 
-    for line in lines:
-        line_str = line.strip()
-        if not line_str:
+    pieces = re.split(r"(?<=[.!?။၊！？])\s+|\n+", text)
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
             continue
-        if len(current_chunk) + len(line_str) + 1 <= max_chunk_len:
-            current_chunk = f"{current_chunk}\n{line_str}" if current_chunk else line_str
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-            if len(line_str) > max_chunk_len:
-                sentences = re.split(r"(?<=[.!?])\s+", line_str)
-                temp_chunk = ""
-                for s in sentences:
-                    if len(temp_chunk) + len(s) + 1 <= max_chunk_len:
-                        temp_chunk = f"{temp_chunk} {s}" if temp_chunk else s
-                    else:
-                        if temp_chunk:
-                            chunks.append(temp_chunk)
-                        temp_chunk = s
-                if temp_chunk:
-                    current_chunk = temp_chunk
-                else:
-                    current_chunk = ""
+        while len(piece) > max_chunk_len:
+            room = max_chunk_len - len(current) - (1 if current else 0)
+            if room <= 0:
+                chunks.append(current)
+                current = ""
+                room = max_chunk_len
+            cut = piece.rfind(" ", 0, room + 1)
+            if cut > 0:
+                part, piece = piece[:cut].rstrip(), piece[cut:].lstrip()
             else:
-                current_chunk = line_str
+                cut = _safe_unicode_cut(piece, room)
+                part, piece = piece[:cut], piece[cut:]
+            combined = f"{current} {part}".strip() if current else part
+            if combined:
+                chunks.append(combined)
+            current = ""
+        if current and len(current) + 1 + len(piece) > max_chunk_len:
+            chunks.append(current)
+            current = ""
+        current = f"{current} {piece}".strip() if current else piece
 
-    if current_chunk:
-        chunks.append(current_chunk)
-
+    if current:
+        chunks.append(current)
     return chunks
 
 
+SPEAKER_LABEL_RE = re.compile(
+    r"^\s*(?:\[\s*)?(?P<label>[^:：\[\]\n]{1,60})(?:\s*\])?\s*[:：]\s*(?P<text>.+)$",
+    re.IGNORECASE,
+)
+
+
 def parse_script(text: str) -> list[tuple[str, str]]:
-    lines = text.split("\n")
-    dialogue = []
-    character_voices = {}
-    voice_pool = list(VOICES.keys())
-    voice_index = 0
+    """Parse English or Burmese speaker labels as routing metadata, not spoken text."""
+    segments: list[tuple[str, str]] = []
+    current_label = "Narrator"
+    current_lines: list[str] = []
 
-    for line in lines:
-        line_str = line.strip()
-        if not line_str:
+    def flush() -> None:
+        content = " ".join(line.strip() for line in current_lines if line.strip()).strip()
+        if content:
+            segments.append((current_label, content))
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush()
+            current_lines.clear()
             continue
-        match = re.match(r"^([A-Za-z0-9_\s]{2,20}):\s*(.+)$", line_str)
+        match = SPEAKER_LABEL_RE.match(line)
         if match:
-            char_name = match.group(1).strip()
-            speech = match.group(2).strip()
-            if char_name not in character_voices:
-                assigned_voice = voice_pool[voice_index % len(voice_pool)]
-                character_voices[char_name] = assigned_voice
-                voice_index += 1
-            dialogue.append((char_name, speech, character_voices[char_name]))
+            flush()
+            current_lines.clear()
+            current_label = re.sub(r"\s+", " ", match.group("label")).strip()
+            current_lines.append(match.group("text").strip())
         else:
-            dialogue.append(("Narrator", line_str, current_voice))
+            current_lines.append(line)
+    flush()
+    if not segments and text.strip():
+        return [("Narrator", text.strip())]
+    return segments
 
-    return dialogue
+
+def voice_for_speaker(label: str, speaker_order: list[str]) -> str:
+    """Choose a stable prebuilt voice by narrator/role hints, then speaker order."""
+    normalized = label.lower()
+    if normalized in {"narrator", "host"} or "ဇာတ်ကြောင်း" in normalized:
+        return current_voice
+    female_hints = (
+        "female", "woman", "girl", "mother", "wife", "မိန်း", "မင်းသမီး", "အမေ", "အမျိုးသမီး"
+    )
+    male_hints = ("male", "man", "boy", "father", "husband", "ကျွန်တော်", "အမျိုးသား")
+    if any(hint in normalized for hint in female_hints):
+        return "Kore"
+    if any(hint in normalized for hint in male_hints):
+        return "Puck"
+    dialogue_speakers = [
+        speaker for speaker in speaker_order
+        if speaker.lower() not in {"narrator", "host"} and "ဇာတ်ကြောင်း" not in speaker
+    ]
+    ordinal = dialogue_speakers.index(label) if label in dialogue_speakers else len(dialogue_speakers)
+    return "Puck" if ordinal % 2 == 0 else "Kore"
+
+
+def expand_script_segments(text: str) -> list[tuple[str, str, str]]:
+    """Return role-labeled, size-bounded (speaker, transcript, voice) segments."""
+    parsed = parse_script(text)
+    speaker_order = list(dict.fromkeys(speaker for speaker, _ in parsed))
+    expanded: list[tuple[str, str, str]] = []
+    for speaker, block in parsed:
+        assigned_voice = voice_for_speaker(speaker, speaker_order)
+        expanded.extend(
+            (speaker, chunk, assigned_voice)
+            for chunk in split_text_for_tts(block)
+        )
+    return expanded
 
 
 def compile_script_to_mp3(
-    text: str, voice_mode: str, speed: str, style: str
+    text: str,
+    voice_mode: str,
+    speed: str,
+    style: str,
+    progress_callback=None,
+    prepared_segments: list[tuple[str, str, str]] | None = None,
 ) -> Path:
-    if voice_mode == "single":
-        chunks = split_text_for_tts(text)
-        segments = [("Narrator", chunk, current_voice) for chunk in chunks]
+    if prepared_segments is not None:
+        segments = prepared_segments
+    elif voice_mode == "single":
+        segments = [("Narrator", chunk, current_voice) for chunk in split_text_for_tts(text)]
     else:
-        segments = parse_script(text)
-
+        segments = expand_script_segments(text)
     if not segments:
         raise ValueError("Text contains no speakable lines.")
 
     master_dir = Path(tempfile.mkdtemp(prefix="telegram-tts-"))
-    segment_paths = []
-
+    segment_paths: list[Path] = []
     try:
         for idx, (speaker, speech_text, voice_name) in enumerate(segments, start=1):
             if idx > 1 and TTS_INTER_SEGMENT_DELAY_SECONDS > 0:
                 time.sleep(TTS_INTER_SEGMENT_DELAY_SECONDS)
-
-            pcm_bytes = generate_audio_segment(speech_text, voice_name, speed, style)
-            raw_path = master_dir / f"segment_{idx:04d}.pcm"
+            wav_path = master_dir / f"segment_{idx:04d}.wav"
             mp3_path = master_dir / f"segment_{idx:04d}.mp3"
-            raw_path.write_bytes(pcm_bytes)
-
+            wav_path.write_bytes(generate_audio_segment(speech_text, voice_name, speed, style))
             subprocess.run(
                 [
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-f", "s16le", "-ar", "24000", "-ac", "1",
-                    "-i", str(raw_path),
-                    "-c:a", "libmp3lame", "-b:a", "192k",
-                    str(mp3_path)
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path),
+                    "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_path),
                 ],
                 check=True,
-                timeout=30,
+                timeout=90,
             )
+            if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+                raise RuntimeError(f"FFmpeg produced an empty MP3 for segment {idx}.")
             segment_paths.append(mp3_path)
+            if progress_callback:
+                progress_callback(idx, len(segments))
 
+        final_name = "voiceover.mp3" if voice_mode == "multi" else "generated_speech.mp3"
+        final_mp3 = master_dir / final_name
         if len(segment_paths) == 1:
-            return segment_paths[0]
-
-        concat_list = master_dir / "concat.txt"
-        with concat_list.open("w", encoding="utf-8") as f:
-            for p in segment_paths:
-                f.write(f"file '{p.name}'\n")
-
-        final_mp3 = master_dir / "full_audio.mp3"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_list),
-                "-c", "copy",
-                str(final_mp3)
-            ],
-            check=True,
-            timeout=60,
-        )
+            segment_paths[0].replace(final_mp3)
+        else:
+            concat_list = master_dir / "concat.txt"
+            concat_list.write_text(
+                "\n".join(f"file '{path.name}'" for path in segment_paths) + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(concat_list), "-c:a", "libmp3lame", "-b:a", "192k",
+                    "-vn", str(final_mp3),
+                ],
+                check=True,
+                timeout=max(120, 30 * len(segment_paths)),
+                cwd=master_dir,
+            )
+        if not final_mp3.exists() or final_mp3.stat().st_size == 0:
+            raise RuntimeError("FFmpeg produced an empty combined MP3 file.")
         return final_mp3
-
     except Exception:
         shutil.rmtree(master_dir, ignore_errors=True)
         raise
@@ -682,13 +809,11 @@ async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_owner(update):
         await reject_unauthorized(update)
         return
-    keyboard = []
-    for v_name, meta in VOICES.items():
-        label = f"{v_name} ({meta['gender']}, {meta['tone']})"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"voice:{v_name}")])
-    keyboard.append([InlineKeyboardButton("« Back to Settings", callback_data="menu:main")])
     if update.message:
-        await update.message.reply_text("Select a voice:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(
+            f"Select a Gemini voice ({len(VOICE_CATALOG)} prebuilt voices):",
+            reply_markup=voice_keyboard(),
+        )
 
 
 async def setspeed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -816,13 +941,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="HTML"
         )
     elif data == "menu:voice":
-        keyboard = []
-        for v_name, meta in VOICES.items():
-            prefix = "✓ " if v_name == current_voice else ""
-            label = f"{prefix}{v_name} ({meta['gender']}, {meta['tone']})"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"voice:{v_name}")])
-        keyboard.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
-        await query.edit_message_text("Select a voice:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            f"Select a Gemini voice ({len(VOICE_CATALOG)} prebuilt voices):",
+            reply_markup=voice_keyboard(),
+        )
     elif data.startswith("voice:"):
         v_name = data.split(":")[1]
         if v_name in VOICES:
@@ -925,7 +1047,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         voice_note_sent = False
         try:
             spoken_text = " ".join(
-                segment_text for _, segment_text, _ in parse_script(text)
+                segment_text for _, segment_text in parse_script(text)
             ).strip()
             if not spoken_text:
                 raise ValueError("Please send non-empty text to synthesize.")
@@ -979,47 +1101,83 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if audio_path:
                 shutil.rmtree(audio_path.parent, ignore_errors=True)
         return
-    if current_voice_mode == "single":
-        segments = [("Narrator", chunk, current_voice) for chunk in split_text_for_tts(text)]
-        mode_label = VOICE_MODES["single"]
-    else:
-        segments = parse_script(text)
-        mode_label = VOICE_MODES["multi"]
-
+    selected_voice = current_voice
+    selected_speed = current_speed
+    selected_style = current_style
+    selected_mode = current_voice_mode
     if len(text) > MAX_TEXT_LENGTH:
         await update.message.reply_text(
             f"Text is too long ({len(text)} characters). Maximum limit is {MAX_TEXT_LENGTH}."
         )
         return
 
+    if selected_mode == "single":
+        segments = [("Narrator", chunk, selected_voice) for chunk in split_text_for_tts(text)]
+        mode_label = VOICE_MODES["single"]
+    else:
+        segments = expand_script_segments(text)
+        mode_label = VOICE_MODES["multi"]
+    if not segments:
+        await update.message.reply_text("Please send non-empty text to generate speech.")
+        return
+
     status_message = await update.message.reply_text(
         f"Generating TTS audio ({mode_label})... {progress_bar(5)}"
     )
-    progress_task = asyncio.create_task(animate_progress(status_message, "Generating TTS audio"))
+    progress_state = {"completed": 0, "total": len(segments)}
+    progress_lock = threading.Lock()
+
+    def record_segment_progress(completed: int, total: int) -> None:
+        with progress_lock:
+            progress_state["completed"] = completed
+            progress_state["total"] = total
+
+    progress_task = asyncio.create_task(
+        animate_progress(status_message, "Generating TTS audio", progress_state, progress_lock)
+    )
 
     mp3_file_path = None
     voice_note_path = None
     try:
         await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         mp3_file_path = await asyncio.to_thread(
-            compile_script_to_mp3, text, current_voice_mode, current_speed, current_style
+            compile_script_to_mp3,
+            text,
+            selected_mode,
+            selected_speed,
+            selected_style,
+            record_segment_progress,
+            segments,
         )
         progress_task.cancel()
         await asyncio.gather(progress_task, return_exceptions=True)
+        await status_message.edit_text(f"TTS segments complete; packaging audio... {progress_bar(95)}")
 
-        voice_note_path = await asyncio.to_thread(convert_to_voice_note, mp3_file_path)
-
-        with voice_note_path.open("rb") as vn_file:
-            await update.message.reply_voice(
-                voice=vn_file,
-                caption=f"Voice: {current_voice} | Speed: {SPEED_LABELS[current_speed]} | Mode: {current_voice_mode}"
-            )
+        try:
+            voice_note_path = await asyncio.to_thread(convert_to_voice_note, mp3_file_path)
+        except Exception:
+            logger.exception("Could not convert Gemini MP3 to a Telegram voice note; sending the MP3 document only.")
+        if voice_note_path:
+            try:
+                with voice_note_path.open("rb") as vn_file:
+                    caption = (
+                        f"Voice: {selected_voice} | Speed: {SPEED_LABELS[selected_speed]}"
+                        if selected_mode == "single"
+                        else "Combined multi-speaker Gemini voiceover"
+                    )
+                    await update.message.reply_voice(voice=vn_file, caption=caption)
+            except Exception:
+                logger.exception("Could not deliver Gemini voice note; sending the MP3 document instead.")
 
         with mp3_file_path.open("rb") as mp3_file:
             await update.message.reply_document(
                 document=mp3_file,
-                filename="generated_speech.mp3",
-                caption="High-quality MP3 audio file"
+                filename="voiceover.mp3" if selected_mode == "multi" else "generated_speech.mp3",
+                caption=(
+                    "Combined multi-speaker voiceover (MP3)"
+                    if selected_mode == "multi"
+                    else "High-quality MP3 audio file"
+                ),
             )
 
         await status_message.edit_text(f"Speech generated successfully! {progress_bar(100)}")
