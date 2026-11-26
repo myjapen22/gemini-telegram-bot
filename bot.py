@@ -2,47 +2,44 @@ import base64
 import asyncio
 import json
 import logging
+import msgpack
 import os
 import re
 import subprocess
 import shutil
 import tempfile
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
 import requests
-from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
-
-load_dotenv()
+from telegram.constants import ChatAction
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logger = logging.getLogger("telegram-gemini-tts-bot")
+logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-_allowed_ids = os.getenv("ALLOWED_TELEGRAM_USER_IDS", os.getenv("TELEGRAM_USER_ID", ""))
-ALLOWED_TELEGRAM_USER_IDS = {
-    int(value.strip()) for value in _allowed_ids.split(",") if value.strip().isdigit()
-}
-if not ALLOWED_TELEGRAM_USER_IDS:
-    raise ValueError("Configure at least one Telegram user ID")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash-tts")
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash-lite-tts")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+ALLOWED_TELEGRAM_USER_IDS = [
+    int(uid.strip())
+    for uid in os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").split(",")
+    if uid.strip().isdigit()
+]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash-tts").strip()
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash-lite-tts").strip()
+DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "Kore").strip()
+DEFAULT_SPEED = os.getenv("DEFAULT_SPEED", "normal").strip()
+DEFAULT_STYLE = os.getenv("DEFAULT_STYLE", "neutral").strip()
+DEFAULT_VOICE_MODE = os.getenv("DEFAULT_VOICE_MODE", "single").strip()
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "4000"))
 TTS_INTER_SEGMENT_DELAY_SECONDS = float(os.getenv("TTS_INTER_SEGMENT_DELAY_SECONDS", "1.0"))
 TTS_FALLBACK_RETRIES = max(1, int(os.getenv("TTS_FALLBACK_RETRIES", "2")))
@@ -50,221 +47,132 @@ TTS_RETRY_BACKOFF_SECONDS = float(os.getenv("TTS_RETRY_BACKOFF_SECONDS", "2.0"))
 PORT = int(os.getenv("PORT", "10000"))
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-# Official Gemini prebuilt TTS catalog: 30 documented voices.
-# The catalog is intentionally included locally so /setvoice works without a catalog API call.
-VOICE_CATALOG = [
-    ("Achernar", "Female"),
-    ("Achird", "Male"),
-    ("Algenib", "Male"),
-    ("Algieba", "Male"),
-    ("Alnilam", "Male"),
-    ("Aoede", "Female"),
-    ("Autonoe", "Female"),
-    ("Callirrhoe", "Female"),
-    ("Charon", "Male"),
-    ("Despina", "Female"),
-    ("Enceladus", "Male"),
-    ("Erinome", "Female"),
-    ("Fenrir", "Male"),
-    ("Gacrux", "Female"),
-    ("Iapetus", "Male"),
-    ("Kore", "Female"),
-    ("Laomedeia", "Female"),
-    ("Leda", "Female"),
-    ("Orus", "Male"),
-    ("Pulcherrima", "Female"),
-    ("Puck", "Male"),
-    ("Rasalgethi", "Male"),
-    ("Sadachbia", "Male"),
-    ("Sadaltager", "Male"),
-    ("Schedar", "Male"),
-    ("Sulafat", "Female"),
-    ("Umbriel", "Male"),
-    ("Vindemiatrix", "Female"),
-    ("Zephyr", "Female"),
-    ("Zubenelgenubi", "Male"),
-]
-VOICE_NAMES = {name for name, _ in VOICE_CATALOG}
-DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "Kore")
-if DEFAULT_VOICE not in VOICE_NAMES:
-    DEFAULT_VOICE = "Kore"
+VOICE_CLONE_API_KEY = (os.getenv("VOICE_CLONE_API_KEY") or os.getenv("FISH_API_KEY") or "").strip()
+VOICE_CLONE_API_BASE_URL = (
+    os.getenv("VOICE_CLONE_API_BASE_URL", "https://api.fish.audio").strip().rstrip("/")
+    or "https://api.fish.audio"
+)
+VOICE_CLONE_TTS_MODEL = "s2.1-pro-free"
+VOICE_CLONE_MAX_UPLOAD_MB = max(1, int(os.getenv("VOICE_CLONE_MAX_UPLOAD_MB", "12")))
+VOICE_CLONE_MIN_AUDIO_SECONDS = max(1, int(os.getenv("VOICE_CLONE_MIN_AUDIO_SECONDS", "10")))
+VOICE_CLONE_MAX_AUDIO_SECONDS = max(
+    VOICE_CLONE_MIN_AUDIO_SECONDS, int(os.getenv("VOICE_CLONE_MAX_AUDIO_SECONDS", "60"))
+)
+VOICE_CLONE_SPEEDS = {"very_slow": 0.75, "normal": 1.0, "fast": 1.25, "very_fast": 1.5}
+VOICE_CLONE_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".opus", ".ogg", ".oga"}
+
+VOICES = {
+    "Puck": {"gender": "Male", "tone": "Upbeat", "description": "Enthusiastic and clear"},
+    "Charon": {"gender": "Male", "tone": "Deep", "description": "Authoritative and calm"},
+    "Kore": {"gender": "Female", "tone": "Relaxed", "description": "Warm and natural"},
+    "Fenrir": {"gender": "Male", "tone": "Intense", "description": "Strong and energetic"},
+    "Aoede": {"gender": "Female", "tone": "Melodic", "description": "Expressive and smooth"},
+}
 
 SPEEDS = {
-    "very_slow": "very slow, deliberate pace",
-    "normal": "natural conversational pace",
-    "fast": "brisk, energetic pace",
-    "very_fast": "very fast, energetic pace",
+    "very_slow": "Speak very slowly with clear pauses",
+    "slow": "Speak slightly slower than normal speed",
+    "normal": "Speak at a natural, standard conversational speed",
+    "fast": "Speak slightly faster than normal speed",
+    "very_fast": "Speak very fast and briskly",
 }
+
 SPEED_LABELS = {
-    "very_slow": "0.75x Very Slow",
-    "normal": "1.0x Normal",
-    "fast": "1.25x Fast",
-    "very_fast": "1.5x Very Fast",
+    "very_slow": "Very Slow",
+    "slow": "Slow",
+    "normal": "Normal",
+    "fast": "Fast",
+    "very_fast": "Very Fast",
 }
-STYLE_CATALOG = [
-    ("suspense", "Suspense & Thriller", "Speak like a tense Burmese movie narrator building suspense and anticipation."),
-    ("dramatic", "Dramatic & Emotional", "Speak like a dramatic Burmese movie narrator with deep emotion and expressive feeling."),
-    ("recap", "Fast-Paced Recap", "Speak like a fast, clear Burmese movie recap narrator with energetic pacing."),
-    ("action", "Action & Energetic", "Speak like an action movie narrator in Burmese: powerful, urgent, and energetic."),
-    ("funny", "Funny & Conversational", "Speak like a funny, friendly Burmese storyteller having a lively conversation."),
-    ("horror", "Dark & Horror", "Speak like a dark Burmese horror narrator: eerie, low, tense, and unsettling."),
-    ("street", "Local Burmese Street-Talk", "Speak naturally like a local Burmese storyteller using relaxed, authentic street-talk."),
-    ("trailer", "Epic & Cinematic Trailer", "Speak like an epic Burmese movie trailer narrator with grand cinematic intensity."),
-    ("nostalgic", "Soft & Sad / Nostalgic", "Speak softly like a sad, nostalgic Burmese movie narrator with tender emotion."),
-    ("satirical", "Satirical & Sarcastic", "Speak like a witty Burmese narrator using playful satire and dry sarcasm."),
-]
-STYLE_NAMES = {key: label for key, label, _ in STYLE_CATALOG}
-STYLE_PROMPTS = {key: prompt for key, _, prompt in STYLE_CATALOG}
+
+STYLES = {
+    "neutral": "Read naturally without exaggerated emotion",
+    "cheerful": "Read with a warm, cheerful, and upbeat tone",
+    "dramatic": "Read with dramatic pacing, emotion, and emphasis",
+    "news": "Read like a professional news broadcaster",
+    "storytelling": "Read like a captivating narrator telling a story",
+}
+
+STYLE_NAMES = {
+    "neutral": "Natural / Neutral",
+    "cheerful": "Cheerful & Upbeat",
+    "dramatic": "Dramatic & Emotional",
+    "news": "News Broadcaster",
+    "storytelling": "Storytelling Narrator",
+}
+
+STYLE_PROMPTS = {
+    "neutral": "Natural speech style",
+    "cheerful": "Upbeat and enthusiastic tone",
+    "dramatic": "Expressive and dramatic tone",
+    "news": "Clear and authoritative news style",
+    "storytelling": "Engaging storytelling tone",
+}
+
 VOICE_MODES = {
-    "single": "👤 Single Speaker",
-    "multi": "👥 Multi-Speaker",
+    "single": "Single Speaker (uses current selected voice)",
+    "multi": "Multi-Speaker (auto-selects voices per character)",
 }
-VOICE_MODE_DESCRIPTIONS = {
-    "single": "အသံတစ်သံတည်းဖြင့် စာသားတစ်ခုလုံးကို Narrator အဖြစ် ဖတ်ပေးမည်။",
-    "multi": "Speaker/Narrator/Character အလိုက် အလိုအလျောက်ခွဲပြီး အသံများပြောင်းကာ ဇာတ်ညွှန်းတစ်ခုလုံးကို MP3 တစ်ဖိုင်အဖြစ် ပေါင်းပေးမည်။",
-}
-STYLE_DESCRIPTIONS = {
-    "suspense": "💡 သင့်တော်သည့် ဇာတ်လမ်း: သဲထိတ်ရင်ဖို၊ စုံထောက်၊ မှုခင်းဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Charon",
-    "dramatic": "💡 သင့်တော်သည့် ဇာတ်လမ်း: အချစ်၊ မိသားစု၊ ဘဝဇာတ်ကြောင်း ဒရာမာများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Kore သို့မဟုတ် Leda",
-    "recap": "💡 သင့်တော်သည့် ဇာတ်လမ်း: Shorts, TikTok, Facebook Reels, 5 Min Recaps\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Achird သို့မဟုတ် Fenrir",
-    "action": "💡 သင့်တော်သည့် ဇာတ်လမ်း: အက်ရှင်၊ သိုင်းဇာတ်လမ်း၊ စူပါဟီးရိုးများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Fenrir သို့မဟုတ် Orion",
-    "funny": "💡 သင့်တော်သည့် ဇာတ်လမ်း: ဟာသ၊ အန်နီမေးရှင်း ကာတွန်း၊ ပေါ့ပေါ့ပါးပါး ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Achird",
-    "horror": "💡 သင့်တော်သည့် ဇာတ်လမ်း: သရဲကား၊ စိတ္တဇ လူသတ်သမား၊ ခြောက်ခြားဖွယ် ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Charon",
-    "street": "💡 သင့်တော်သည့် ဇာတ်လမ်း: TikTok/Facebook Short Video၊ လူငယ်ကြိုက် ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Achird သို့မဟုတ် Puck",
-    "trailer": "💡 သင့်တော်သည့် ဇာတ်လမ်း: ရုပ်ရှင် ကြော်ငြာအသံ၊ Sci-Fi၊ သမိုင်းဝင် ကာတွန်း/ရုပ်ရှင်များ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Orion သို့မဟုတ် Charon",
-    "nostalgic": "💡 သင့်တော်သည့် ဇာတ်လမ်း: ဝမ်းနည်းဖွယ် အချစ်၊ မိသားစု ဒရာမာများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Leda သို့မဟုတ် Kore",
-    "satirical": "💡 သင့်တော်သည့် ဇာတ်လမ်း: Movie Mistakes Review၊ စောင်းမြောင်း ရယ်စရာ ဇာတ်လမ်းများ။\n🎙️ အလိုက်ဖက်ဆုံး အသံ: Puck သို့မဟုတ် Achird",
-}
-VOICE_DESCRIPTIONS = {
-    "Kore": "💡 အချစ်၊ မိသားစု၊ ဒရာမာနှင့် ဝမ်းနည်းဖွယ် ဇာတ်လမ်းများအတွက် အထူးကောင်းမွန်သည်။",
-    "Leda": "💡 အေးဆေးညင်သာသော ဇာတ်လမ်းများ၊ ပုံပြင်များနှင့် အလွမ်းကားများအတွက် သင့်တော်သည်။",
-    "Puck": "💡 စုံထောက်၊ သဲထိတ်ရင်ဖို၊ ဟာသနှင့် ပေါ့ပေါ့ပါးပါး Movie Review များအတွက် အထူးကောင်းမွန်သည်။",
-    "Charon": "💡 သရဲကား၊ စိတ္တဇ လူသတ်သမားနှင့် Horror ဇာတ်လမ်းများအတွက် အနက်သံ အကောင်းဆုံးဖြစ်သည်။",
-    "Fenrir": "💡 အက်ရှင်၊ TikTok Shorts နှင့် မြန်မြန်ဆန်ဆန် ဇာတ်လမ်းပြောပြရန် သင့်တော်သည်။",
-    "Achird": "💡 အက်ရှင်၊ TikTok Shorts နှင့် မြန်မြန်ဆန်ဆန် ဇာတ်လမ်းပြောပြရန် သင့်တော်သည်။",
-    "Orion": "💡 Superhero ကားများနှင့် ရုပ်ရှင် ကြော်ငြာအသံ (Trailer Style) အတွက် အသံဩဇာ အပြည့်ပါသည်။",
-}
-FEMALE_VOICE_FALLBACK = "💡 အချစ်၊ မိသားစု၊ ဒရာမာ၊ ပုံပြင်များနှင့် အေးဆေးညင်သာသော ဇာတ်လမ်းများအတွက် သင့်တော်ပါသည်။"
-MALE_VOICE_FALLBACK = "💡 အက်ရှင်၊ သဲထိတ်ရင်ဖို၊ စုံထောက်၊ TikTok/Reels Shorts နှင့် Movie Recaps များအတွက် သင့်တော်ပါသည်။"
-current_voice = DEFAULT_VOICE
-current_speed = os.getenv("DEFAULT_SPEED", "normal")
-if current_speed not in SPEEDS:
-    current_speed = "normal"
-current_style = os.getenv("DEFAULT_STYLE", "trailer")
-if current_style not in STYLE_NAMES:
-    current_style = "trailer"
-current_voice_mode = os.getenv("VOICE_MODE", "multi")
-if current_voice_mode not in VOICE_MODES:
-    current_voice_mode = "multi"
+
+current_voice = DEFAULT_VOICE if DEFAULT_VOICE in VOICES else "Kore"
+current_speed = DEFAULT_SPEED if DEFAULT_SPEED in SPEEDS else "normal"
+current_style = DEFAULT_STYLE if DEFAULT_STYLE in STYLES else "neutral"
+current_voice_mode = DEFAULT_VOICE_MODE if DEFAULT_VOICE_MODE in VOICE_MODES else "single"
 
 
 def is_owner(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id in ALLOWED_TELEGRAM_USER_IDS)
+    user = update.effective_user
+    if not user:
+        return False
+    return not ALLOWED_TELEGRAM_USER_IDS or user.id in ALLOWED_TELEGRAM_USER_IDS
 
 
 async def reject_unauthorized(update: Update) -> None:
     if update.message:
-        await update.message.reply_text("Sorry, this bot is private and only available to authorized users.")
+        await update.message.reply_text("Unauthorized user. Access denied.")
 
 
-def voice_keyboard(pending_index: int | None = None) -> InlineKeyboardMarkup:
-    buttons = []
-    for index, (name, gender) in enumerate(VOICE_CATALOG):
-        marker = "⏳ " if pending_index == index else "✓ " if name == current_voice else ""
-        label = f"{marker}{name} ({gender[0]})"
-        buttons.append(InlineKeyboardButton(label, callback_data=f"voice:{index}"))
-    rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
-    if pending_index is not None:
-        rows.append([InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:voice:{pending_index}")])
-    rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
-    return InlineKeyboardMarkup(rows)
+def progress_bar(percent: int) -> str:
+    filled = min(10, max(0, percent // 10))
+    return f"[{'█' * filled}{'░' * (10 - filled)}] {percent}%"
 
 
-def voice_description(name: str, gender: str) -> str:
-    if name in VOICE_DESCRIPTIONS:
-        return VOICE_DESCRIPTIONS[name]
-    return FEMALE_VOICE_FALLBACK if gender == "Female" else MALE_VOICE_FALLBACK
-
-
-def speed_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            f"{'✓ ' if current_speed == key else ''}{SPEED_LABELS[key]}",
-            callback_data=f"speed:{key}",
-        )
-        for key in SPEEDS
-    ]
-    return InlineKeyboardMarkup([[button] for button in buttons] + [[
-        InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")
-    ]])
-
-
-def style_keyboard(pending_key: str | None = None) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            f"{'⏳ ' if pending_key == key else '✓ ' if current_style == key else ''}{label}",
-            callback_data=f"style:{key}",
-        )
-        for key, label, _ in STYLE_CATALOG
-    ]
-    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
-    if pending_key is not None:
-        rows.append([InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:style:{pending_key}")])
-    rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
-    return InlineKeyboardMarkup(rows)
-
-
-def voice_mode_keyboard(pending_mode: str | None = None) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton(
-            f"{'⏳ ' if pending_mode == key else '✓ ' if current_voice_mode == key else ''}{label}",
-            callback_data=f"mode:{key}",
-        )
-    ] for key, label in VOICE_MODES.items()]
-    if pending_mode is not None:
-        rows.append([InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:mode:{pending_mode}")])
-    rows.append([InlineKeyboardButton("↩ Back to main menu", callback_data="menu:home")])
-    return InlineKeyboardMarkup(rows)
-
-
-def confirmation_keyboard(kind: str, value: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm / Select", callback_data=f"confirm:{kind}:{value}")],
-        [InlineKeyboardButton("🔙 Back to List", callback_data=f"back:{kind}")],
-    ])
-
-
-def start_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎙 Select Voice", callback_data="menu:voice")],
-        [InlineKeyboardButton("🗣 Select Voice Mode", callback_data="menu:mode")],
-        [InlineKeyboardButton("⚡ Select Speed", callback_data="menu:speed")],
-        [InlineKeyboardButton("🎬 Select Movie Style", callback_data="menu:style")],
-    ])
+async def animate_progress(message, base_text: str):
+    steps = [15, 35, 60, 80, 95]
+    try:
+        for percent in steps:
+            await asyncio.sleep(1.2)
+            await message.edit_text(f"{base_text}... {progress_bar(percent)}")
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
 def welcome_text() -> str:
     return (
-        "Welcome to the private Gemini TTS bot.\n\n"
-        f"Current voice: {current_voice}\n"
+        "<b>Gemini Text-to-Speech Bot</b>\n\n"
+        f"Current Voice: {current_voice} ({VOICES[current_voice]['gender']}, {VOICES[current_voice]['tone']})\n"
         f"Voice mode: {VOICE_MODES[current_voice_mode]}\n"
         f"Current speed: {SPEED_LABELS[current_speed]}\n\n"
         f"Current style: {STYLE_NAMES[current_style]}\n\n"
-        "Choose a setting below, then send me any text."
+        "Choose a setting below, then send me any text.\n\n"
+        "Optional voice cloning: /clonevoice, then send a short audio sample. Use /cancelclone to return to Gemini TTS."
     )
 
 
-def extract_audio_base64(payload: dict) -> str | None:
-    output_audio = payload.get("output_audio")
-    if isinstance(output_audio, dict) and output_audio.get("data"):
-        return output_audio["data"]
-    for step in reversed(payload.get("steps", [])):
-        if step.get("type") != "model_output":
-            continue
-        for content in reversed(step.get("content", [])):
-            if content.get("type") == "audio" and content.get("data"):
-                return content["data"]
-    return None
+def settings_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("🎙 Set Voice", callback_data="menu:voice"),
+            InlineKeyboardButton("⚡ Set Speed", callback_data="menu:speed"),
+        ],
+        [
+            InlineKeyboardButton("🎭 Set Style", callback_data="menu:style"),
+            InlineKeyboardButton("👥 Voice Mode", callback_data="menu:mode"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 class GeminiTTSAPIError(RuntimeError):
@@ -275,342 +183,75 @@ class GeminiTTSAPIError(RuntimeError):
         super().__init__(f"Gemini TTS API error {status_code} for {model}: {body[:1000]}")
 
 
-def _generate_audio_base64(text: str, voice: str, model: str, speed: str, style: str) -> str:
-    delivery = f"{STYLE_PROMPTS[style]}; {SPEEDS[speed]}"
+class VoiceCloneAPIError(RuntimeError):
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"Voice-cloning provider returned HTTP {status_code}")
+
+
+class VoiceCloneConfigurationError(RuntimeError):
+    pass
+
+
+def _generate_voice_clone_audio(
+    text: str, reference_audio: bytes, reference_transcript: str, speed: str
+) -> bytes:
+    if not VOICE_CLONE_API_KEY:
+        raise VoiceCloneConfigurationError("Voice-cloning API key is not configured")
     payload = {
-        "model": model,
-        "input": [{
-            "type": "user_input",
-            "content": [{
-                "type": "text",
-                "text": text,
-                "annotations": [{
-                    "type": "speech_metadata",
-                    "style": delivery,
-                }],
-            }],
-        }],
-        "response_format": {"type": "audio"},
-        "generation_config": {"speech_config": [{"voice": voice}]},
+        "text": text,
+        "references": [{"audio": reference_audio, "text": reference_transcript}],
+        "format": "mp3",
+        "normalize": True,
+        "prosody": {"speed": VOICE_CLONE_SPEEDS.get(speed, 1.0)},
     }
     response = requests.post(
-        GEMINI_INTERACTIONS_URL,
-        headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"},
-        json=payload,
-        timeout=120,
+        f"{VOICE_CLONE_API_BASE_URL}/v1/tts",
+        headers={
+            "Authorization": f"Bearer {VOICE_CLONE_API_KEY}",
+            "Content-Type": "application/msgpack",
+            "model": VOICE_CLONE_TTS_MODEL,
+        },
+        data=msgpack.packb(payload, use_bin_type=True),
+        timeout=(15, 120),
     )
     if not response.ok:
-        raise GeminiTTSAPIError(response.status_code, model, response.text)
-    try:
-        response_payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Gemini returned non-JSON response for {model}: {response.text[:1000]}") from exc
-    audio_b64 = extract_audio_base64(response_payload)
-    if not audio_b64:
-        raise RuntimeError(f"Gemini returned no audio data for {model}: {response.text[:1000]}")
-    return audio_b64
+        raise VoiceCloneAPIError(response.status_code)
+    if not response.content:
+        raise RuntimeError("Voice-cloning provider returned empty audio")
+    if "json" in response.headers.get("Content-Type", "").lower():
+        raise RuntimeError("Voice-cloning provider returned an error instead of audio")
+    return response.content
 
 
-def synthesize_speech(text: str, voice: str, speed: str, style: str = "trailer") -> Path:
-    """Generate audio with per-turn primary/lite fallback and transient retries."""
-    models = [GEMINI_MODEL]
-    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL not in models:
-        models.append(GEMINI_FALLBACK_MODEL)
-    audio_b64 = None
-    last_api_error = None
-    retryable_statuses = {429, 500, 502, 503, 504}
-    for model_index, model in enumerate(models):
-        # The primary gets one attempt before the lite fallback is invoked.
-        # The fallback gets bounded retries so one transient response does not
-        # abort the entire combined multi-speaker file.
-        max_attempts = TTS_FALLBACK_RETRIES if model_index else 1
-        for attempt in range(1, max_attempts + 1):
-            try:
-                audio_b64 = _generate_audio_base64(text, voice, model, speed, style)
-                if model_index:
-                    logger.info(
-                        "Gemini TTS fallback succeeded for speaker turn: model=%s voice=%s attempt=%s",
-                        model, voice, attempt,
-                    )
-                break
-            except GeminiTTSAPIError as exc:
-                last_api_error = exc
-                logger.error(
-                    "Gemini TTS request failed: model=%s status=%s voice=%s attempt=%s/%s body=%s",
-                    exc.model, exc.status_code, voice, attempt, max_attempts, exc.body[:2000],
-                )
-                if model_index == 0 and exc.status_code in retryable_statuses and len(models) > 1:
-                    logger.warning(
-                        "Primary model rate-limited/unavailable for this speaker turn; "
-                        "invoking fallback model=%s",
-                        GEMINI_FALLBACK_MODEL,
-                    )
-                    break
-                if exc.status_code not in retryable_statuses or attempt >= max_attempts:
-                    raise
-                delay = TTS_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning("Retrying fallback model after %.1fs for speaker turn", delay)
-                time.sleep(delay)
-        if audio_b64:
-            break
-    if not audio_b64:
-        if last_api_error:
-            raise last_api_error
-        raise RuntimeError("Gemini returned no audio data")
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="telegram-gemini-tts-"))
-    wav_path = temp_dir / "speech.wav"
-    mp3_path = temp_dir / "speech.mp3"
-    try:
-        wav_path.write_bytes(base64.b64decode(audio_b64))
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", "192k", "-vn", str(mp3_path)],
-            check=True,
-            timeout=90,
-        )
-        if not mp3_path.exists() or mp3_path.stat().st_size == 0:
-            raise RuntimeError("FFmpeg produced an empty MP3 file")
-        wav_path.unlink(missing_ok=True)
-        return mp3_path
-    except Exception:
-        for path in (wav_path, mp3_path):
-            path.unlink(missing_ok=True)
-        temp_dir.rmdir()
-        raise
-
-
-def cleanup_audio(audio_path: Path) -> None:
-    audio_path.unlink(missing_ok=True)
-    for leftover in audio_path.parent.iterdir():
-        leftover.unlink(missing_ok=True)
-    audio_path.parent.rmdir()
-
-
-def convert_to_voice_note(mp3_path: Path) -> Path:
-    """Convert a generated MP3 preview to Telegram Voice Note OGG/Opus."""
-    ogg_path = mp3_path.parent / "preview.ogg"
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
-                "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", "-vn", str(ogg_path),
-            ],
-            check=True,
-            timeout=90,
-        )
-        if not ogg_path.exists() or ogg_path.stat().st_size == 0:
-            raise RuntimeError("FFmpeg produced an empty OGG voice note")
-        return ogg_path
-    except Exception:
-        ogg_path.unlink(missing_ok=True)
-        raise
-
-
-def tts_failure_message(exc: Exception) -> str:
-    if isinstance(exc, GeminiTTSAPIError):
-        if exc.status_code == 429:
-            return (
-                "Google Gemini TTS quota/rate limit reached for this API project. "
-                "Please wait for the quota reset or enable a paid Gemini tier."
-            )
-        if exc.status_code in {500, 502, 503, 504}:
-            return "Google Gemini TTS is temporarily busy. Please try again in a few minutes."
-        if exc.status_code in {401, 403}:
-            return "The Gemini API key is invalid or lacks access to the selected TTS model."
-    return "I could not generate audio right now. Please try again later."
-
-
-def progress_bar(percent: int, width: int = 10) -> str:
-    filled = max(0, min(width, round(percent * width / 100)))
-    return f"[{'█' * filled}{'░' * (width - filled)}] {percent}%"
-
-
-async def animate_progress(status_message, prefix: str = "Generating audio") -> None:
-    """Keep Telegram status visibly moving while the blocking TTS request runs."""
-    stages = (15, 25, 35, 45, 55, 65, 75, 82)
-    try:
-        for percent in stages:
-            await asyncio.sleep(2.5)
-            await status_message.edit_text(f"{prefix}... {progress_bar(percent)}")
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.debug("Unable to update Telegram progress message", exc_info=True)
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-    """Minimal Render health endpoint; Telegram polling remains in the main thread."""
-
-    def _health_body(self) -> bytes:
-        return json.dumps({"status": "ok", "service": "telegram-gemini-tts"}).encode()
-
-    def do_GET(self) -> None:
-        if self.path.rstrip("/") not in ("", "/health"):
-            self.send_response(404)
-            self.end_headers()
-            return
-        body = self._health_body()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_HEAD(self) -> None:
-        if self.path.rstrip("/") not in ("", "/health"):
-            self.send_response(404)
-            self.end_headers()
-            return
-        body = self._health_body()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-
-    def log_message(self, format: str, *args: object) -> None:
-        logger.info("health-server: " + format, *args)
-
-
-def start_health_server() -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
-    thread.start()
-    logger.info("Health endpoint listening on 0.0.0.0:%s/health", PORT)
-    return server
-
-
-def split_text_for_tts(text: str, max_length: int = MAX_TEXT_LENGTH) -> list[str]:
-    """Split long text at paragraph/sentence/word boundaries without exceeding the TTS limit."""
-    if len(text) <= max_length:
-        return [text]
-
-    pieces = re.split(r"(?<=[.!?။！？])\s+|\n+", text)
-    chunks: list[str] = []
-    current = ""
-    for piece in pieces:
-        piece = piece.strip()
-        if not piece:
-            continue
-        candidate = f"{current} {piece}".strip() if current else piece
-        if len(candidate) <= max_length:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-            current = ""
-        while len(piece) > max_length:
-            cut = piece.rfind(" ", 0, max_length + 1)
-            if cut <= 0:
-                cut = max_length
-            chunks.append(piece[:cut].strip())
-            piece = piece[cut:].strip()
-        current = piece
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-SPEAKER_LABEL_RE = re.compile(
-    # Any non-empty label before a line-leading colon is metadata only. This
-    # intentionally supports Burmese names such as ရှာနန်းဝေး, စနစ်, and ဂျန်ဂျုန်း.
-    r"^\s*(?:\[\s*)?(?P<label>[^:：\[\]\n]{1,60})(?:\s*\])?\s*[:：]\s*(?P<text>.+)$",
-    re.IGNORECASE,
-)
-
-
-def parse_script(text: str) -> list[tuple[str, str]]:
-    """Parse labels as routing metadata; never include the labels in spoken text."""
-    segments: list[tuple[str, str]] = []
-    current_label = "Narrator"
-    current_lines: list[str] = []
-
-    def flush() -> None:
-        content = " ".join(line.strip() for line in current_lines if line.strip()).strip()
-        if content:
-            segments.append((current_label, content))
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            flush()
-            current_lines.clear()
-            continue
-        match = SPEAKER_LABEL_RE.match(line)
-        if match:
-            flush()
-            current_lines.clear()
-            current_label = re.sub(r"\s+", " ", match.group("label")).strip()
-            # Only the captured dialogue text is retained; the label and its
-            # separator are deliberately discarded before TTS synthesis.
-            current_lines.append(match.group("text").strip())
-        else:
-            current_lines.append(line)
-    flush()
-
-    if not segments:
-        return [("Narrator", text.strip())]
-    return segments
-
-
-def voice_for_speaker(label: str, speaker_order: list[str]) -> str:
-    """Choose a stable voice profile from role/name hints and speaker order."""
-    normalized = label.lower()
-    if normalized in {"narrator", "host"}:
-        return current_voice
-    female_hints = ("female", "woman", "girl", "mother", "wife", "မ", "မိန်း", "အမေ")
-    male_hints = ("male", "man", "boy", "father", "husband", "ကျွန်တော်", "အမျိုးသား")
-    if any(hint in normalized for hint in female_hints):
-        return "Kore"
-    if any(hint in normalized for hint in male_hints):
-        return "Puck"
-    dialogue_speakers = [speaker for speaker in speaker_order if speaker.lower() not in {"narrator", "host"}]
-    ordinal = dialogue_speakers.index(label) if label in dialogue_speakers else len(dialogue_speakers)
-    if ordinal % 2 == 0:
-        return "Puck"
-    return "Kore"
-
-
-def expand_script_segments(text: str) -> list[tuple[str, str, str]]:
-    """Return (speaker, text, assigned voice), splitting oversized blocks safely."""
-    parsed = parse_script(text)
-    speaker_order: list[str] = []
-    for speaker, _ in parsed:
-        if speaker not in speaker_order:
-            speaker_order.append(speaker)
-    expanded: list[tuple[str, str, str]] = []
-    for speaker, block in parsed:
-        assigned_voice = voice_for_speaker(speaker, speaker_order)
-        for chunk in split_text_for_tts(block):
-            expanded.append((speaker, chunk, assigned_voice))
-    return expanded
-
-
-def compile_script_to_mp3(segments: list[tuple[str, str, str]], speed: str, style: str) -> Path:
-    """Synthesize all speaker segments and concatenate them into one MP3."""
-    master_dir = Path(tempfile.mkdtemp(prefix="telegram-gemini-script-"))
+def compile_cloned_voice_to_mp3(
+    text: str, reference_audio_path: Path, reference_transcript: str, speed: str
+) -> Path:
+    chunks = split_text_for_tts(text)
+    if not chunks or not any(chunk.strip() for chunk in chunks):
+        raise ValueError("Please send non-empty text to synthesize")
+    reference_audio = reference_audio_path.read_bytes()
+    if not reference_audio or not reference_transcript.strip():
+        raise ValueError("The reference audio and its exact transcript are both required")
+    master_dir = Path(tempfile.mkdtemp(prefix="telegram-voice-clone-"))
     segment_paths: list[Path] = []
     try:
-        for index, (_, segment_text, assigned_voice) in enumerate(segments, start=1):
+        for index, chunk in enumerate(chunks, start=1):
             if index > 1 and TTS_INTER_SEGMENT_DELAY_SECONDS > 0:
-                logger.info(
-                    "Rate-limit pacing: waiting %.2fs before speaker turn %s/%s",
-                    TTS_INTER_SEGMENT_DELAY_SECONDS, index, len(segments),
-                )
                 time.sleep(TTS_INTER_SEGMENT_DELAY_SECONDS)
-            logger.info(
-                "Synthesizing speaker turn %s/%s with voice=%s; fallback=%s",
-                index, len(segments), assigned_voice, GEMINI_FALLBACK_MODEL,
+            audio_bytes = _generate_voice_clone_audio(
+                chunk, reference_audio, reference_transcript, speed
             )
-            generated = synthesize_speech(segment_text, assigned_voice, speed, style)
-            target = master_dir / f"segment_{index:04d}.mp3"
-            shutil.copy2(generated, target)
-            cleanup_audio(generated)
-            segment_paths.append(target)
-        if not segment_paths:
-            raise ValueError("No speech segments were detected")
+            segment_path = master_dir / f"segment_{index:04d}.mp3"
+            segment_path.write_bytes(audio_bytes)
+            segment_paths.append(segment_path)
+        if len(segment_paths) == 1:
+            return segment_paths[0]
         concat_list = master_dir / "concat.txt"
-        concat_list.write_text("\n".join(f"file '{path.name}'" for path in segment_paths) + "\n", encoding="utf-8")
-        final_path = master_dir / "voiceover.mp3"
+        concat_list.write_text(
+            "\n".join(f"file '{path.name}'" for path in segment_paths) + "\n", encoding="utf-8"
+        )
+        final_path = master_dir / "voice-clone.mp3"
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
              "-i", str(concat_list), "-c:a", "libmp3lame", "-b:a", "192k", "-vn", str(final_path)],
@@ -619,206 +260,528 @@ def compile_script_to_mp3(segments: list[tuple[str, str, str]], speed: str, styl
             cwd=master_dir,
         )
         if not final_path.exists() or final_path.stat().st_size == 0:
-            raise RuntimeError("FFmpeg produced an empty combined MP3 file")
-        for path in segment_paths:
-            path.unlink(missing_ok=True)
-        concat_list.unlink(missing_ok=True)
+            raise RuntimeError("FFmpeg produced an empty cloned-voice MP3")
         return final_path
     except Exception:
         shutil.rmtree(master_dir, ignore_errors=True)
         raise
 
 
+def transcode_clone_sample(source_path: Path, target_path: Path) -> None:
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(source_path),
+         "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(target_path)],
+        check=True,
+        timeout=30,
+    )
+    if not target_path.exists() or target_path.stat().st_size == 0:
+        raise RuntimeError("Audio conversion produced an empty WAV sample")
+
+
+def probe_audio_duration(audio_path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return float(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def clear_voice_clone_session(user_data: dict) -> None:
+    sample_path = user_data.pop("voice_clone_sample_path", None)
+    for key in (
+        "voice_clone_pending_audio",
+        "voice_clone_pending_transcript",
+        "voice_clone_transcript",
+    ):
+        user_data.pop(key, None)
+    if sample_path:
+        shutil.rmtree(Path(sample_path).parent, ignore_errors=True)
+
+
+def clone_audio_attachment(message):
+    if message.voice:
+        return message.voice, "telegram-voice.opus", message.voice.duration, None
+    attachment = message.audio or message.document
+    if not attachment:
+        return None, None, None, "Please send a Telegram voice note or an MP3, WAV, M4A, or Opus audio file."
+    filename = getattr(attachment, "file_name", None) or ""
+    mime_type = (getattr(attachment, "mime_type", None) or "").lower()
+    suffix = Path(filename).suffix.lower()
+    if not suffix:
+        suffix = {
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mp4": ".m4a",
+            "audio/ogg": ".opus",
+            "audio/opus": ".opus",
+        }.get(mime_type, "")
+    if suffix not in VOICE_CLONE_AUDIO_SUFFIXES:
+        return None, None, None, "Unsupported audio format. Send a voice note, MP3, WAV, M4A, or Opus file."
+    safe_suffix = ".opus" if suffix in {".ogg", ".oga"} else suffix
+    duration = getattr(attachment, "duration", None)
+    return attachment, f"voice-sample{safe_suffix}", duration, None
+
+
+def _generate_audio_base64(text: str, voice: str, model: str, speed: str, style: str) -> str:
+    delivery = f"{STYLE_PROMPTS[style]}; {SPEEDS[speed]}"
+    payload = {
+        "model": model,
+        "input": text,
+        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
+        "delivery_instruction": delivery,
+    }
+
+    url = f"{GEMINI_INTERACTIONS_URL}?key={GEMINI_API_KEY}"
+    res = requests.post(url, json=payload, timeout=60)
+    if not res.ok:
+        raise GeminiTTSAPIError(res.status_code, model, res.text)
+
+    data = res.json()
+    try:
+        candidates = data.get("candidates", [])
+        parts = candidates[0]["content"]["parts"]
+        for part in parts:
+            if "inlineData" in part and "data" in part["inlineData"]:
+                return part["inlineData"]["data"]
+    except (IndexError, KeyError, TypeError) as e:
+        raise RuntimeError(f"Unexpected API response structure from Gemini ({model}): {data}") from e
+
+    raise RuntimeError(f"No audio inlineData returned in API response from Gemini ({model}).")
+
+
+def generate_audio_segment(text: str, voice: str, speed: str, style: str) -> bytes:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models_to_try.append(GEMINI_FALLBACK_MODEL)
+
+    last_exception = None
+    for attempt_model in models_to_try:
+        for attempt in range(1, TTS_FALLBACK_RETRIES + 1):
+            try:
+                b64_str = _generate_audio_base64(text, voice, attempt_model, speed, style)
+                return base64.b64decode(b64_str)
+            except GeminiTTSAPIError as exc:
+                last_exception = exc
+                if exc.status_code == 429:
+                    logger.warning("Quota 429 on %s (attempt %d/%d).", attempt_model, attempt, TTS_FALLBACK_RETRIES)
+                    if attempt < TTS_FALLBACK_RETRIES:
+                        time.sleep(TTS_RETRY_BACKOFF_SECONDS * attempt)
+                        continue
+                    break
+                else:
+                    logger.error("API Error %d on %s: %s", exc.status_code, attempt_model, exc.body[:200])
+                    break
+            except Exception as exc:
+                last_exception = exc
+                logger.error("Unexpected error generating audio with %s: %s", attempt_model, str(exc))
+                break
+
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Failed to generate audio segment.")
+
+
+def split_text_for_tts(text: str, max_chunk_len: int = 800) -> list[str]:
+    lines = text.split("\n")
+    chunks = []
+    current_chunk = ""
+
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+        if len(current_chunk) + len(line_str) + 1 <= max_chunk_len:
+            current_chunk = f"{current_chunk}\n{line_str}" if current_chunk else line_str
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            if len(line_str) > max_chunk_len:
+                sentences = re.split(r"(?<=[.!?])\s+", line_str)
+                temp_chunk = ""
+                for s in sentences:
+                    if len(temp_chunk) + len(s) + 1 <= max_chunk_len:
+                        temp_chunk = f"{temp_chunk} {s}" if temp_chunk else s
+                    else:
+                        if temp_chunk:
+                            chunks.append(temp_chunk)
+                        temp_chunk = s
+                if temp_chunk:
+                    current_chunk = temp_chunk
+                else:
+                    current_chunk = ""
+            else:
+                current_chunk = line_str
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def parse_script(text: str) -> list[tuple[str, str]]:
+    lines = text.split("\n")
+    dialogue = []
+    character_voices = {}
+    voice_pool = list(VOICES.keys())
+    voice_index = 0
+
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+        match = re.match(r"^([A-Za-z0-9_\s]{2,20}):\s*(.+)$", line_str)
+        if match:
+            char_name = match.group(1).strip()
+            speech = match.group(2).strip()
+            if char_name not in character_voices:
+                assigned_voice = voice_pool[voice_index % len(voice_pool)]
+                character_voices[char_name] = assigned_voice
+                voice_index += 1
+            dialogue.append((char_name, speech, character_voices[char_name]))
+        else:
+            dialogue.append(("Narrator", line_str, current_voice))
+
+    return dialogue
+
+
+def compile_script_to_mp3(
+    text: str, voice_mode: str, speed: str, style: str
+) -> Path:
+    if voice_mode == "single":
+        chunks = split_text_for_tts(text)
+        segments = [("Narrator", chunk, current_voice) for chunk in chunks]
+    else:
+        segments = parse_script(text)
+
+    if not segments:
+        raise ValueError("Text contains no speakable lines.")
+
+    master_dir = Path(tempfile.mkdtemp(prefix="telegram-tts-"))
+    segment_paths = []
+
+    try:
+        for idx, (speaker, speech_text, voice_name) in enumerate(segments, start=1):
+            if idx > 1 and TTS_INTER_SEGMENT_DELAY_SECONDS > 0:
+                time.sleep(TTS_INTER_SEGMENT_DELAY_SECONDS)
+
+            pcm_bytes = generate_audio_segment(speech_text, voice_name, speed, style)
+            raw_path = master_dir / f"segment_{idx:04d}.pcm"
+            mp3_path = master_dir / f"segment_{idx:04d}.mp3"
+            raw_path.write_bytes(pcm_bytes)
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-f", "s16le", "-ar", "24000", "-ac", "1",
+                    "-i", str(raw_path),
+                    "-c:a", "libmp3lame", "-b:a", "192k",
+                    str(mp3_path)
+                ],
+                check=True,
+                timeout=30,
+            )
+            segment_paths.append(mp3_path)
+
+        if len(segment_paths) == 1:
+            return segment_paths[0]
+
+        concat_list = master_dir / "concat.txt"
+        with concat_list.open("w", encoding="utf-8") as f:
+            for p in segment_paths:
+                f.write(f"file '{p.name}'\n")
+
+        final_mp3 = master_dir / "full_audio.mp3"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_list),
+                "-c", "copy",
+                str(final_mp3)
+            ],
+            check=True,
+            timeout=60,
+        )
+        return final_mp3
+
+    except Exception:
+        shutil.rmtree(master_dir, ignore_errors=True)
+        raise
+
+
+def convert_to_voice_note(mp3_path: Path) -> Path:
+    ogg_path = mp3_path.with_suffix(".ogg")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(mp3_path),
+            "-c:a", "libopus", "-b:a", "32k",
+            str(ogg_path)
+        ],
+        check=True,
+        timeout=30,
+    )
+    return ogg_path
+
+
+def tts_failure_message(exc: Exception) -> str:
+    if isinstance(exc, VoiceCloneConfigurationError):
+        return "Voice cloning is not configured. Add VOICE_CLONE_API_KEY (or FISH_API_KEY) in Render Environment; do not send API keys in Telegram."
+    if isinstance(exc, VoiceCloneAPIError):
+        if exc.status_code in {401, 403}:
+            return "The voice-cloning API key is missing, invalid, or lacks access. Check VOICE_CLONE_API_KEY in Render Environment."
+        if exc.status_code == 402:
+            return "The voice-cloning provider reports no available free-model credit. Confirm VOICE_CLONE_TTS_MODEL is s2.1-pro-free, then check the provider account or wait for its free allowance to return."
+        if exc.status_code == 429:
+            return "The voice-cloning provider's free-tier quota or rate limit has been reached. Please wait and try again later."
+        if exc.status_code in {500, 502, 503, 504}:
+            return "The voice-cloning provider is temporarily busy. Please try again in a few minutes."
+        if exc.status_code == 413:
+            return "The voice sample is too large for the provider. Send a shorter or smaller audio clip."
+        if exc.status_code == 400:
+            return "The provider rejected this sample or request. Use a clear, single-speaker clip of at least 10 seconds in MP3, WAV, M4A, or Opus format."
+        return "The voice-cloning API request failed. Please check the provider settings and try again."
+    if isinstance(exc, GeminiTTSAPIError):
+        if exc.status_code == 429:
+            return (
+                "Daily or minute Gemini API rate limits hit (HTTP 429).\n\n"
+                "Suggestions:\n"
+                "• Wait a minute and try again.\n"
+                "• Check your Google AI Studio quota limits."
+            )
+        return f"Gemini API returned error code {exc.status_code}."
+    return f"Failed to generate speech: {str(exc)}"
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
-    elif update.message:
-        await update.message.reply_text(welcome_text(), reply_markup=start_keyboard())
+        return
+    if update.message:
+        await update.message.reply_text(
+            welcome_text(),
+            reply_markup=settings_keyboard(),
+            parse_mode="HTML"
+        )
 
 
 async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
-    elif update.message:
-        current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
-        await update.message.reply_text(
-            f"Current voice: {current_voice} ({current_gender})\n{voice_description(current_voice, current_gender)}\n\n"
-            f"Choose one of the {len(VOICE_CATALOG)} Gemini voices:",
-            reply_markup=voice_keyboard(),
-        )
+        return
+    keyboard = []
+    for v_name, meta in VOICES.items():
+        label = f"{v_name} ({meta['gender']}, {meta['tone']})"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"voice:{v_name}")])
+    keyboard.append([InlineKeyboardButton("« Back to Settings", callback_data="menu:main")])
+    if update.message:
+        await update.message.reply_text("Select a voice:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def setspeed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
-    elif update.message:
+        return
+    keyboard = []
+    for spd_key, spd_label in SPEED_LABELS.items():
+        keyboard.append([InlineKeyboardButton(spd_label, callback_data=f"speed:{spd_key}")])
+    keyboard.append([InlineKeyboardButton("« Back to Settings", callback_data="menu:main")])
+    if update.message:
+        await update.message.reply_text("Select speed:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def clonevoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await reject_unauthorized(update)
+        return
+    if not update.message:
+        return
+    if not VOICE_CLONE_API_KEY:
         await update.message.reply_text(
-            f"Current speed: {SPEED_LABELS[current_speed]}\nChoose a speed:",
-            reply_markup=speed_keyboard(),
+            "Voice cloning is not configured yet. Add VOICE_CLONE_API_KEY (or FISH_API_KEY) in Render Environment, then restart the service. Do not send API keys in chat."
         )
+        return
+    context.user_data["voice_clone_pending_audio"] = True
+    await update.message.reply_text(
+        "Send a clear, single-speaker voice note or MP3/WAV/M4A/Opus clip, "
+        f"{VOICE_CLONE_MIN_AUDIO_SECONDS}–{VOICE_CLONE_MAX_AUDIO_SECONDS} seconds and up to "
+        f"{VOICE_CLONE_MAX_UPLOAD_MB} MB. Only send your own voice or a voice you have explicit permission to clone. "
+        "Fish Audio's free instant-clone request needs the exact words spoken in the sample; after uploading, send that transcript. "
+        "The sample is sent with each generation request and is not saved as a provider-side voice model. Use /cancelclone to stop."
+    )
+
+
+async def cancelclone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await reject_unauthorized(update)
+        return
+    context.user_data.pop("voice_clone_pending_audio", None)
+    context.user_data.pop("voice_clone_model_id", None)
+    if update.message:
+        await update.message.reply_text(
+            "Cloned-voice mode is off. New text will use the existing Gemini TTS behavior. The provider-side private clone is not deleted; remove it in your Fish Audio account if desired."
+        )
+
+
+async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await reject_unauthorized(update)
+        return
+    message = update.message
+    if not message:
+        return
+    if not context.user_data.get("voice_clone_pending_audio"):
+        await handle_other_message(update, context)
+        return
+    if not VOICE_CLONE_API_KEY:
+        context.user_data.pop("voice_clone_pending_audio", None)
+        await message.reply_text(tts_failure_message(VoiceCloneConfigurationError("missing key")))
+        return
+    attachment, upload_name, duration, error = clone_audio_attachment(message)
+    if error:
+        await message.reply_text(error)
+        return
+    max_bytes = VOICE_CLONE_MAX_UPLOAD_MB * 1024 * 1024
+    if attachment.file_size and attachment.file_size > max_bytes:
+        await message.reply_text(f"That file is too large. The current limit is {VOICE_CLONE_MAX_UPLOAD_MB} MB.")
+        return
+    if duration is not None and not VOICE_CLONE_MIN_AUDIO_SECONDS <= duration <= VOICE_CLONE_MAX_AUDIO_SECONDS:
+        await message.reply_text(
+            f"Please send a clip between {VOICE_CLONE_MIN_AUDIO_SECONDS} and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
+        )
+        return
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="telegram-clone-upload-"))
+    source_path = temp_dir / upload_name
+    sample_path = temp_dir / "reference.wav"
+    keep_sample = False
+    status_message = await message.reply_text("Receiving the sample and preparing it for instant voice cloning…")
+    try:
+        telegram_file = await context.bot.get_file(attachment.file_id)
+        await telegram_file.download_to_drive(custom_path=str(source_path))
+        if not source_path.exists() or source_path.stat().st_size == 0:
+            raise RuntimeError("Telegram returned an empty audio file")
+        if source_path.stat().st_size > max_bytes:
+            raise ValueError(f"The downloaded file exceeds the {VOICE_CLONE_MAX_UPLOAD_MB} MB limit")
+        measured_duration = duration if duration is not None else await asyncio.to_thread(probe_audio_duration, source_path)
+        if measured_duration is not None and not VOICE_CLONE_MIN_AUDIO_SECONDS <= measured_duration <= VOICE_CLONE_MAX_AUDIO_SECONDS:
+            raise ValueError(
+                f"Please send a clip between {VOICE_CLONE_MIN_AUDIO_SECONDS} and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long"
+            )
+        await asyncio.to_thread(transcode_clone_sample, source_path, sample_path)
+        source_path.unlink(missing_ok=True)
+        clear_voice_clone_session(context.user_data)
+        context.user_data["voice_clone_sample_path"] = str(sample_path)
+        context.user_data["voice_clone_pending_transcript"] = True
+        context.user_data.pop("voice_clone_pending_audio", None)
+        keep_sample = True
+        await status_message.edit_text(
+            "Audio sample is ready. Now send the exact words spoken in that sample. After that, send the text to synthesize. Use /cancelclone to remove the local sample."
+        )
+    except Exception as exc:
+        logger.warning("Voice clone setup failed: %s", type(exc).__name__)
+        detail = str(exc) if isinstance(exc, ValueError) else tts_failure_message(exc)
+        await status_message.edit_text(f"Voice-clone setup failed. {detail}")
+    finally:
+        if not keep_sample:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global current_voice, current_speed, current_style, current_voice_mode
     query = update.callback_query
-    if not query or not is_owner(update):
+    if not query:
         return
     await query.answer()
-    kind, value = query.data.split(":", 1)
-    if kind == "confirm":
-        confirm_kind, confirm_value = value.split(":", 1)
-        if confirm_kind == "voice":
-            index = int(confirm_value)
-            if context.user_data.get("pending_voice_index") != index or not 0 <= index < len(VOICE_CATALOG):
-                await query.edit_message_text("This voice preview has expired. Please choose a voice again.", reply_markup=voice_keyboard())
-                return
-            current_voice = VOICE_CATALOG[index][0]
-            context.user_data.pop("pending_voice_index", None)
+
+    if not is_owner(update):
+        await query.edit_message_text("Unauthorized user.")
+        return
+
+    data = query.data
+    if data == "menu:main":
+        await query.edit_message_text(
+            welcome_text(),
+            reply_markup=settings_keyboard(),
+            parse_mode="HTML"
+        )
+    elif data == "menu:voice":
+        keyboard = []
+        for v_name, meta in VOICES.items():
+            prefix = "✓ " if v_name == current_voice else ""
+            label = f"{prefix}{v_name} ({meta['gender']}, {meta['tone']})"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"voice:{v_name}")])
+        keyboard.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
+        await query.edit_message_text("Select a voice:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("voice:"):
+        v_name = data.split(":")[1]
+        if v_name in VOICES:
+            current_voice = v_name
             await query.edit_message_text(
-                f"✅ Voice selected: {current_voice}\n{voice_description(current_voice, VOICE_CATALOG[index][1])}",
-                reply_markup=start_keyboard(),
+                f"Voice changed to <b>{current_voice}</b>.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
+                parse_mode="HTML"
             )
-        elif confirm_kind == "style":
-            if context.user_data.get("pending_style_key") != confirm_value or confirm_value not in STYLE_NAMES:
-                await query.edit_message_text("This style preview has expired. Please choose a style again.", reply_markup=style_keyboard())
-                return
-            current_style = confirm_value
-            context.user_data.pop("pending_style_key", None)
+    elif data == "menu:speed":
+        keyboard = []
+        for spd_key, spd_label in SPEED_LABELS.items():
+            prefix = "✓ " if spd_key == current_speed else ""
+            keyboard.append([InlineKeyboardButton(f"{prefix}{spd_label}", callback_data=f"speed:{spd_key}")])
+        keyboard.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
+        await query.edit_message_text("Select speed:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("speed:"):
+        spd_key = data.split(":")[1]
+        if spd_key in SPEEDS:
+            current_speed = spd_key
             await query.edit_message_text(
-                f"✅ Movie style selected: {STYLE_NAMES[current_style]}\n\n{STYLE_DESCRIPTIONS[current_style]}",
-                reply_markup=start_keyboard(),
+                f"Speed changed to <b>{SPEED_LABELS[current_speed]}</b>.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
+                parse_mode="HTML"
             )
-        elif confirm_kind == "mode":
-            if context.user_data.get("pending_voice_mode") != confirm_value or confirm_value not in VOICE_MODES:
-                await query.edit_message_text(
-                    "This Voice Mode selection has expired. Please choose again.",
-                    reply_markup=voice_mode_keyboard(),
-                )
-                return
-            current_voice_mode = confirm_value
-            context.user_data.pop("pending_voice_mode", None)
+    elif data == "menu:style":
+        keyboard = []
+        for st_key, st_name in STYLE_NAMES.items():
+            prefix = "✓ " if st_key == current_style else ""
+            keyboard.append([InlineKeyboardButton(f"{prefix}{st_name}", callback_data=f"style:{st_key}")])
+        keyboard.append([InlineKeyboardButton("« Back", callback_data="menu:main")])
+        await query.edit_message_text("Select voice style:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("style:"):
+        st_key = data.split(":")[1]
+        if st_key in STYLES:
+            current_style = st_key
             await query.edit_message_text(
-                f"✅ Voice Mode selected: {VOICE_MODES[current_voice_mode]}\n{VOICE_MODE_DESCRIPTIONS[current_voice_mode]}",
-                reply_markup=start_keyboard(),
+                f"Style changed to <b>{STYLE_NAMES[current_style]}</b>.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
+                parse_mode="HTML"
             )
-    elif kind == "back":
-        context.user_data.pop("pending_voice_index", None)
-        context.user_data.pop("pending_style_key", None)
-        if value == "voice":
-            current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
+    elif data == "menu:mode":
+        keyboard = [
+            [InlineKeyboardButton("Single Speaker", callback_data="mode:single")],
+            [InlineKeyboardButton("Multi-Speaker (Script)", callback_data="mode:multi")],
+            [InlineKeyboardButton("« Back", callback_data="menu:main")],
+        ]
+        await query.edit_message_text("Select voice mode:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("mode:"):
+        mode_key = data.split(":")[1]
+        if mode_key in VOICE_MODES:
+            current_voice_mode = mode_key
             await query.edit_message_text(
-                f"Current voice: {current_voice} ({current_gender})\n{voice_description(current_voice, current_gender)}\n\nChoose a Gemini voice:",
-                reply_markup=voice_keyboard(),
+                f"Voice mode changed to <b>{VOICE_MODES[current_voice_mode]}</b>.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="menu:main")]]),
+                parse_mode="HTML"
             )
-        elif value == "style":
-            await query.edit_message_text(
-                f"Current movie style: {STYLE_NAMES[current_style]}\n{STYLE_DESCRIPTIONS[current_style]}\n\nChoose a voiceover style:",
-                reply_markup=style_keyboard(),
-            )
-    elif kind == "menu" and value == "home":
-        context.user_data.pop("pending_voice_index", None)
-        context.user_data.pop("pending_style_key", None)
-        context.user_data.pop("pending_voice_mode", None)
-        await query.edit_message_text(welcome_text(), reply_markup=start_keyboard())
-    elif kind == "menu" and value == "voice":
-        current_gender = next(gender for name, gender in VOICE_CATALOG if name == current_voice)
-        await query.edit_message_text(
-            f"Current voice: {current_voice} ({current_gender})\n{voice_description(current_voice, current_gender)}\n\n"
-            "Choose a Gemini voice:",
-            reply_markup=voice_keyboard(),
-        )
-    elif kind == "menu" and value == "speed":
-        await query.edit_message_text(
-            f"Current speed: {SPEED_LABELS[current_speed]}\nChoose a speech speed:",
-            reply_markup=speed_keyboard(),
-        )
-    elif kind == "menu" and value == "mode":
-        await query.edit_message_text(
-            f"Current Voice Mode: {VOICE_MODES[current_voice_mode]}\n{VOICE_MODE_DESCRIPTIONS[current_voice_mode]}\n\n"
-            "Choose how the script should be spoken:",
-            reply_markup=voice_mode_keyboard(),
-        )
-    elif kind == "menu" and value == "style":
-        await query.edit_message_text(
-            f"Current movie style: {STYLE_NAMES[current_style]}\n{STYLE_DESCRIPTIONS[current_style]}\n\n"
-            "Choose a voiceover style:",
-            reply_markup=style_keyboard(),
-        )
-    elif kind == "voice":
-        index = int(value)
-        if index < 0 or index >= len(VOICE_CATALOG):
-            await query.edit_message_text("Unknown voice selection.")
-            return
-        preview_voice, gender = VOICE_CATALOG[index]
-        context.user_data["pending_voice_index"] = index
-        description = voice_description(preview_voice, gender)
-        await query.edit_message_text(
-            f"Selected: {preview_voice} ({gender}) — Pending Confirmation\n"
-            f"{description}\n\n"
-            "Preview audio is being generated. Use ✅ Confirm to apply this voice.",
-            reply_markup=voice_keyboard(index),
-        )
-        speaker = "ကျွန်တော်" if gender == "Male" else "ကျွန်မ"
-        preview_text = f"မင်္ဂလာပါ၊ {speaker}ကတော့ {preview_voice} ဖြစ်ပါတယ်။"
-        audio_path = None
-        voice_note_path = None
-        try:
-            await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-            audio_path = await __import__("asyncio").to_thread(
-                synthesize_speech, preview_text, preview_voice, current_speed, current_style
-            )
-            voice_note_path = await __import__("asyncio").to_thread(convert_to_voice_note, audio_path)
-            with voice_note_path.open("rb") as voice_file:
-                await query.message.reply_voice(voice=voice_file)
-        except Exception as exc:
-            logger.exception("Voice preview generation failed for %s", preview_voice)
-            await query.message.reply_text(f"Preview for {preview_voice} failed: {tts_failure_message(exc)}")
-        finally:
-            if voice_note_path:
-                cleanup_audio(voice_note_path)
-            elif audio_path:
-                cleanup_audio(audio_path)
-    elif kind == "speed" and value in SPEEDS:
-        current_speed = value
-        await query.edit_message_text(
-            f"Speed changed to {SPEED_LABELS[value]}.",
-            reply_markup=start_keyboard(),
-        )
-    elif kind == "style" and value in STYLE_NAMES:
-        context.user_data["pending_style_key"] = value
-        await query.edit_message_text(
-            f"Selected: {STYLE_NAMES[value]} — Pending Confirmation\n\n"
-            f"{STYLE_DESCRIPTIONS[value]}\n\n"
-            "Generating a style preview voice note. Use ✅ Confirm to apply this movie style.",
-            reply_markup=style_keyboard(value),
-        )
-        style_preview_text = f"မင်္ဂလာပါ။ ဒီအသံပုံစံက {STYLE_NAMES[value]} ဖြစ်ပါတယ်။"
-        audio_path = None
-        voice_note_path = None
-        try:
-            await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-            audio_path = await __import__("asyncio").to_thread(
-                synthesize_speech, style_preview_text, current_voice, current_speed, value
-            )
-            voice_note_path = await __import__("asyncio").to_thread(convert_to_voice_note, audio_path)
-            with voice_note_path.open("rb") as voice_file:
-                await query.message.reply_voice(voice=voice_file)
-        except Exception as exc:
-            logger.exception("Style preview generation failed for %s", value)
-            await query.message.reply_text(f"Preview for {STYLE_NAMES[value]} failed: {tts_failure_message(exc)}")
-        finally:
-            if voice_note_path:
-                cleanup_audio(voice_note_path)
-            elif audio_path:
-                cleanup_audio(audio_path)
-    elif kind == "mode" and value in VOICE_MODES:
-        context.user_data["pending_voice_mode"] = value
-        await query.edit_message_text(
-            f"Selected: {VOICE_MODES[value]} — Pending Confirmation\n\n"
-            f"{VOICE_MODE_DESCRIPTIONS[value]}\n\n"
-            "Use ✅ Confirm to apply this Voice Mode.",
-            reply_markup=voice_mode_keyboard(value),
-        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -827,77 +790,151 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not update.message or not update.message.text:
         return
+
     text = update.message.text.strip()
     if not text:
+        return
+    if context.user_data.get("voice_clone_pending_audio"):
+        await update.message.reply_text("Please send the audio sample first, or use /cancelclone to stop setup.")
+        return
+    if context.user_data.get("voice_clone_pending_transcript"):
+        if len(text) > MAX_TEXT_LENGTH:
+            await update.message.reply_text(f"Please keep the reference transcript under {MAX_TEXT_LENGTH} characters.")
+            return
+        context.user_data["voice_clone_transcript"] = text
+        context.user_data.pop("voice_clone_pending_transcript", None)
+        await update.message.reply_text("Reference transcript saved. Now send the text you want spoken in that voice.")
+        return
+    clone_sample_path = context.user_data.get("voice_clone_sample_path")
+    clone_transcript = context.user_data.get("voice_clone_transcript")
+    if clone_sample_path and clone_transcript:
+        sample_path = Path(clone_sample_path)
+        if not sample_path.exists():
+            clear_voice_clone_session(context.user_data)
+            await update.message.reply_text("The temporary voice sample has expired. Start again with /clonevoice.")
+            return
+        spoken_text = " ".join(segment_text for _, segment_text in parse_script(text))
+        status_message = await update.message.reply_text(
+            f"Generating speech with your private cloned voice... {progress_bar(5)}"
+        )
+        progress_task = asyncio.create_task(animate_progress(status_message, "Generating cloned-voice audio"))
+        audio_path = None
+        try:
+            await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            audio_path = await asyncio.to_thread(
+                compile_cloned_voice_to_mp3, spoken_text, sample_path, clone_transcript, current_speed
+            )
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+            with audio_path.open("rb") as audio_file:
+                await update.message.reply_document(
+                    document=audio_file,
+                    filename="cloned-voiceover.mp3",
+                    caption="Speech generated with your cloned voice",
+                )
+            await status_message.edit_text(f"Cloned voiceover ready... {progress_bar(100)}")
+        except Exception as exc:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+            logger.warning("Cloned-voice synthesis failed: %s", type(exc).__name__)
+            detail = str(exc) if isinstance(exc, ValueError) else tts_failure_message(exc)
+            await status_message.edit_text(
+                f"Cloned-voice generation failed... {progress_bar(100)}\n{detail}"
+            )
+        finally:
+            if audio_path:
+                shutil.rmtree(audio_path.parent, ignore_errors=True)
         return
     if current_voice_mode == "single":
         segments = [("Narrator", chunk, current_voice) for chunk in split_text_for_tts(text)]
         mode_label = VOICE_MODES["single"]
     else:
-        segments = expand_script_segments(text)
+        segments = parse_script(text)
         mode_label = VOICE_MODES["multi"]
-    speaker_count = len({speaker for speaker, _, _ in segments})
+
+    if len(text) > MAX_TEXT_LENGTH:
+        await update.message.reply_text(
+            f"Text is too long ({len(text)} characters). Maximum limit is {MAX_TEXT_LENGTH}."
+        )
+        return
+
     status_message = await update.message.reply_text(
-        f"{mode_label}: analyzing {speaker_count} role(s) and generating one combined MP3... {progress_bar(5)}"
+        f"Generating TTS audio ({mode_label})... {progress_bar(5)}"
     )
-    progress_task = asyncio.create_task(animate_progress(status_message, "Generating combined audio"))
-    audio_path = None
+    progress_task = asyncio.create_task(animate_progress(status_message, "Generating TTS audio"))
+
+    mp3_file_path = None
+    voice_note_path = None
     try:
         await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-        logger.info(
-            "Voice mode=%s segments=%s speakers=%s assignments=%s",
-            current_voice_mode,
-            len(segments), speaker_count, [(speaker, voice) for speaker, _, voice in segments],
-        )
-        audio_path = await asyncio.to_thread(
-            compile_script_to_mp3, segments, current_speed, current_style
+        mp3_file_path = await asyncio.to_thread(
+            compile_script_to_mp3, text, current_voice_mode, current_speed, current_style
         )
         progress_task.cancel()
         await asyncio.gather(progress_task, return_exceptions=True)
-        await status_message.edit_text(
-            f"Combining {len(segments)} speaker segment(s) into one MP3... {progress_bar(90)}"
-        )
-        with audio_path.open("rb") as audio_file:
-            await update.message.reply_document(
-                document=audio_file,
-                filename="voiceover.mp3",
-                caption=f"Combined {mode_label} voiceover ({speaker_count} role(s))",
+
+        voice_note_path = await asyncio.to_thread(convert_to_voice_note, mp3_file_path)
+
+        with voice_note_path.open("rb") as vn_file:
+            await update.message.reply_voice(
+                voice=vn_file,
+                caption=f"Voice: {current_voice} | Speed: {SPEED_LABELS[current_speed]} | Mode: {current_voice_mode}"
             )
-        await status_message.edit_text(f"Voiceover ready... {progress_bar(100)}")
+
+        with mp3_file_path.open("rb") as mp3_file:
+            await update.message.reply_document(
+                document=mp3_file,
+                filename="generated_speech.mp3",
+                caption="High-quality MP3 audio file"
+            )
+
+        await status_message.edit_text(f"Speech generated successfully! {progress_bar(100)}")
+
     except Exception as exc:
         progress_task.cancel()
         await asyncio.gather(progress_task, return_exceptions=True)
-        logger.exception("Combined multi-speaker Gemini TTS generation failed")
+        logger.error("Error handling TTS text: %s", str(exc))
         await status_message.edit_text(
-            f"Combined audio generation failed... {progress_bar(100)}\n{tts_failure_message(exc)}"
+            f"Generation failed... {progress_bar(100)}\n{tts_failure_message(exc)}"
         )
     finally:
-        if audio_path:
-            shutil.rmtree(audio_path.parent, ignore_errors=True)
+        if mp3_file_path and mp3_file_path.exists():
+            shutil.rmtree(mp3_file_path.parent, ignore_errors=True)
 
 
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
-    elif update.message:
-        await update.message.reply_text("Send text, or use /setvoice or /setspeed.")
+        return
+    if update.message:
+        await update.message.reply_text("Please send plain text to generate speech.")
 
 
 def build_application() -> Application:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setvoice", setvoice_command))
     application.add_handler(CommandHandler("setspeed", setspeed_command))
+    application.add_handler(CommandHandler("clonevoice", clonevoice_command))
+    application.add_handler(CommandHandler("cancelclone", cancelclone_command))
     application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style|mode|confirm|back):"))
+    application.add_handler(
+        MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.ALL, clone_audio_handler)
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_other_message))
     return application
 
 
 if __name__ == "__main__":
-    start_health_server()
-    logger.info(
-        "Starting Gemini TTS bot for %s authorized users: model=%s voice=%s speed=%s",
-        len(ALLOWED_TELEGRAM_USER_IDS), GEMINI_MODEL, current_voice, current_speed,
-    )
-    build_application().run_polling(allowed_updates=Update.ALL_TYPES)
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is not set.")
+        exit(1)
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY environment variable is not set.")
+        exit(1)
+
+    app = build_application()
+    logger.info("Bot is starting polling...")
+    app.run_polling()
