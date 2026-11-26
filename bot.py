@@ -2,6 +2,7 @@ import base64
 import asyncio
 import json
 import logging
+import threading
 import msgpack
 import os
 import re
@@ -10,6 +11,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,6 +27,9 @@ from telegram.constants import ChatAction
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# HTTPX logs full Telegram API URLs at INFO, including the bot token in the URL path.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -299,6 +304,7 @@ def clear_voice_clone_session(user_data: dict) -> None:
         "voice_clone_pending_audio",
         "voice_clone_pending_transcript",
         "voice_clone_transcript",
+        "voice_clone_model_id",
     ):
         user_data.pop(key, None)
     if sample_path:
@@ -627,11 +633,10 @@ async def cancelclone_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_owner(update):
         await reject_unauthorized(update)
         return
-    context.user_data.pop("voice_clone_pending_audio", None)
-    context.user_data.pop("voice_clone_model_id", None)
+    clear_voice_clone_session(context.user_data)
     if update.message:
         await update.message.reply_text(
-            "Cloned-voice mode is off. New text will use the existing Gemini TTS behavior. The provider-side private clone is not deleted; remove it in your Fish Audio account if desired."
+            "Cloned-voice mode is off. The temporary sample was removed from this bot instance. New text will use the existing Gemini TTS behavior."
         )
 
 
@@ -910,6 +915,47 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Please send plain text to generate speech.")
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Minimal Render health endpoint; Telegram polling remains in the main thread."""
+
+    def _health_body(self) -> bytes:
+        return json.dumps({"status": "ok", "service": "telegram-gemini-tts"}).encode()
+
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") not in ("", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = self._health_body()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self) -> None:
+        if self.path.rstrip("/") not in ("", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = self._health_body()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        logger.info("health-server: " + format, *args)
+
+
+def start_health_server() -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
+    thread.start()
+    logger.info("Health endpoint listening on 0.0.0.0:%s/health", PORT)
+    return server
+
+
 def build_application() -> Application:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -935,6 +981,7 @@ if __name__ == "__main__":
         logger.error("GEMINI_API_KEY environment variable is not set.")
         exit(1)
 
+    start_health_server()
     app = build_application()
     logger.info("Bot is starting polling...")
     app.run_polling()

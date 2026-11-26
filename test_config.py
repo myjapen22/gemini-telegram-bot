@@ -1,4 +1,9 @@
+import asyncio
 import os
+import shutil
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 from dotenv import load_dotenv
 
@@ -15,16 +20,45 @@ if not configured_ids or any(not value.isdigit() or int(value) <= 0 for value in
 
 import bot  # noqa: E402
 
-assert len(bot.VOICE_CATALOG) == 30
-assert {"Aoede", "Charon", "Fenrir", "Kore", "Puck", "Despina", "Iapetus", "Rasalgethi", "Sadachbia", "Sulafat", "Zephyr"} <= bot.VOICE_NAMES
-assert set(bot.SPEEDS) == {"very_slow", "normal", "fast", "very_fast"}
-assert bot.SPEED_LABELS == {
-    "very_slow": "0.75x Very Slow",
-    "normal": "1.0x Normal",
-    "fast": "1.25x Fast",
-    "very_fast": "1.5x Very Fast",
-}
+assert {"Aoede", "Charon", "Fenrir", "Kore", "Puck"} <= set(bot.VOICES)
+assert set(bot.VOICE_MODES) == {"single", "multi"}
+assert set(bot.SPEEDS) == set(bot.SPEED_LABELS)
 assert bot.ALLOWED_TELEGRAM_USER_IDS
 app = bot.build_application()
 assert app is not None
-print("Gemini TTS configuration and application construction passed; no network calls were made.")
+
+sample_root = Path(tempfile.mkdtemp(prefix="voice-clone-config-test-"))
+sample_dir = sample_root / "session"
+sample_dir.mkdir()
+sample_path = sample_dir / "reference.wav"
+sample_path.write_bytes(b"test")
+user_data = {
+    "voice_clone_sample_path": str(sample_path),
+    "voice_clone_pending_audio": True,
+    "voice_clone_pending_transcript": True,
+    "voice_clone_transcript": "sample transcript",
+    "voice_clone_model_id": "obsolete-model",
+}
+
+class TestMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text):
+        self.replies.append(text)
+
+message = TestMessage()
+update = SimpleNamespace(
+    effective_user=SimpleNamespace(id=bot.ALLOWED_TELEGRAM_USER_IDS[0]),
+    message=message,
+)
+context = SimpleNamespace(user_data=user_data)
+try:
+    asyncio.run(bot.cancelclone_command(update, context))
+    assert user_data == {}
+    assert not sample_dir.exists()
+    assert "Gemini TTS" in message.replies[0]
+finally:
+    shutil.rmtree(sample_root, ignore_errors=True)
+
+print("Gemini TTS configuration and voice-clone cleanup passed; no network calls were made.")
