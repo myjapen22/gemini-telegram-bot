@@ -70,7 +70,7 @@ python bot.py
 - `/start`
 - `/setvoice` — complete Gemini prebuilt voice catalog
 - `/setspeed` — Slow, Normal, Fast
-- `/clonevoice` — optional Fish Audio instant voice cloning; use a clear 15–30 second sample and an exact transcript. Add `VOICE_CLONE_API_KEY` in Render Environment to enable it.
+- `/clonevoice` — optional Fish Audio voice cloning; use a clear 15–30 second reference sample and an exact transcript. Add `FISH_AUDIO_API_KEY` in Render Environment (`VOICE_CLONE_API_KEY` and `FISH_API_KEY` remain supported aliases). Once setup is complete, send text for clone TTS or a Burmese voice note for transcription followed by synthesis in the saved reference voice. Voice-note output depends on transcription quality and is not direct acoustic voice conversion or a guarantee of perfect pronunciation.
 - `/cancelclone` — remove the temporary clone sample and return to Gemini TTS.
 
 For Burmese clone speech, the bot normalizes Unicode to NFC, tidies whitespace, converts Myanmar digits to standard Arabic digits in synthesis text, and preserves Burmese combining marks and joiners. The reference transcript keeps its original spoken words and digit forms, with spacing cleanup only, so it stays aligned with the uploaded sample. Fish Audio's text rewriter is disabled for clone requests because its documented number-normalization language list does not include Burmese. Synthesis uses the documented `s2.1-pro-free` model and MP3 output at 44.1 kHz / 192 kbps, with the provider's documented sampling defaults.

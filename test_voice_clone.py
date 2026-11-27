@@ -87,6 +87,14 @@ class DurationValidationTests(unittest.TestCase):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 bot.validate_voice_clone_sample_duration(duration)
 
+    def test_voice_note_conversion_accepts_short_spoken_input_but_rejects_invalid_duration(self):
+        bot.validate_voice_clone_conversion_duration(1)
+        bot.validate_voice_clone_conversion_duration(5)
+        with self.assertRaisesRegex(ValueError, "between 1 and"):
+            bot.validate_voice_clone_conversion_duration(0.5)
+        with self.assertRaisesRegex(ValueError, "Could not verify"):
+            bot.validate_voice_clone_conversion_duration(None)
+
 
 class BurmeseClonePreprocessingTests(unittest.TestCase):
     def test_unicode_whitespace_and_myanmar_digits_are_normalized(self):
@@ -282,8 +290,95 @@ class CloneHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("background noise", guidance)
         self.assertIn("word-for-word transcript", guidance)
 
+    async def test_initialized_clone_mode_transcribes_voice_note_then_sends_cloned_audio(self):
+        with tempfile.TemporaryDirectory(prefix="clone-voice-note-test-") as temp:
+            root = Path(temp)
+            reference_path = root / "reference.wav"
+            reference_path.write_bytes(b"reference sample")
+            output_dir = root / "out"
+            output_dir.mkdir()
+            mp3_path = output_dir / "cloned.mp3"
+            mp3_path.write_bytes(b"mp3 output")
+            voice_note_path = output_dir / "cloned.ogg"
+            voice_note_path.write_bytes(b"opus output")
+            voice = SimpleNamespace(file_id="voice-note-id", file_size=100, duration=4)
+            message = FakeMessage(voice=voice)
+            context = SimpleNamespace(
+                user_data={
+                    "voice_clone_sample_path": str(reference_path),
+                    "voice_clone_transcript": "တိကျသောနမူနာစာသား",
+                },
+                bot=FakeTelegramBot(),
+            )
+            with patch.object(bot, "probe_audio_duration", return_value=4), patch.object(
+                bot, "_transcribe_voice_clone_audio", return_value="နေကောင်းလား"
+            ) as transcribe, patch.object(
+                bot, "compile_cloned_voice_to_mp3", return_value=mp3_path
+            ) as synthesize, patch.object(
+                bot, "convert_to_voice_note", return_value=voice_note_path
+            ):
+                await bot.clone_audio_handler(owner_update(message), context)
+            transcribe.assert_called_once()
+            self.assertEqual(synthesize.call_args.args[0], "နေကောင်းလား")
+            self.assertEqual(synthesize.call_args.args[1], reference_path)
+            self.assertEqual(synthesize.call_args.args[2], "တိကျသောနမူနာစာသား")
+            self.assertEqual(message.voice_payload, b"opus output")
+            self.assertEqual(message.document_payload, b"mp3 output")
+            self.assertIn("cloned voice", message.status.edits[-1])
+
+    async def test_voice_note_asr_quota_error_is_reported_without_audio_delivery(self):
+        with tempfile.TemporaryDirectory(prefix="clone-voice-note-error-") as temp:
+            reference_path = Path(temp) / "reference.wav"
+            reference_path.write_bytes(b"sample")
+            voice = SimpleNamespace(file_id="voice-note-id", file_size=100, duration=3)
+            message = FakeMessage(voice=voice)
+            context = SimpleNamespace(
+                user_data={
+                    "voice_clone_sample_path": str(reference_path),
+                    "voice_clone_transcript": "exact reference words",
+                },
+                bot=FakeTelegramBot(),
+            )
+            with patch.object(bot, "probe_audio_duration", return_value=3), patch.object(
+                bot, "_transcribe_voice_clone_audio", side_effect=bot.VoiceCloneAPIError(429)
+            ):
+                await bot.clone_audio_handler(owner_update(message), context)
+            self.assertIn("quota or rate limit", message.status.edits[-1])
+            self.assertIsNone(message.voice_payload)
+            self.assertIsNone(message.document_payload)
+
+    async def test_voice_note_during_reference_transcript_step_is_not_mistaken_for_conversion(self):
+        message = FakeMessage(voice=SimpleNamespace(file_id="sample", file_size=100, duration=12))
+        context = SimpleNamespace(user_data={"voice_clone_pending_transcript": True}, bot=FakeTelegramBot())
+        with patch.object(bot, "_transcribe_voice_clone_audio") as transcribe:
+            await bot.clone_audio_handler(owner_update(message), context)
+        self.assertIn("exact transcript", message.reply_texts[0])
+        transcribe.assert_not_called()
+
 
 class FishAudioErrorTests(unittest.TestCase):
+    def test_fish_audio_key_is_preferred_and_legacy_aliases_remain_supported(self):
+        with patch.dict(os.environ, {"FISH_AUDIO_API_KEY": " primary ", "VOICE_CLONE_API_KEY": "legacy", "FISH_API_KEY": "old"}, clear=True):
+            self.assertEqual(bot._configured_voice_clone_api_key(), "primary")
+        with patch.dict(os.environ, {"VOICE_CLONE_API_KEY": "legacy", "FISH_API_KEY": "old"}, clear=True):
+            self.assertEqual(bot._configured_voice_clone_api_key(), "legacy")
+        with patch.dict(os.environ, {"FISH_API_KEY": "old"}, clear=True):
+            self.assertEqual(bot._configured_voice_clone_api_key(), "old")
+
+    def test_asr_uses_documented_multipart_endpoint_and_returns_transcript(self):
+        with tempfile.TemporaryDirectory(prefix="fish-asr-test-") as temp:
+            audio_path = Path(temp) / "input.wav"
+            audio_path.write_bytes(b"wav audio")
+            response = SimpleNamespace(ok=True, status_code=200, json=lambda: {"text": "နေကောင်းလား"})
+            with patch.object(bot.requests, "post", return_value=response) as post:
+                transcript = bot._transcribe_voice_clone_audio(audio_path)
+            self.assertEqual(transcript, "နေကောင်းလား")
+            self.assertEqual(post.call_args.args[0], f"{bot.VOICE_CLONE_API_BASE_URL}/v1/asr")
+            self.assertEqual(post.call_args.kwargs["headers"]["model"], "transcribe-1-pro")
+            self.assertNotIn("language", post.call_args.kwargs["data"])
+            self.assertEqual(post.call_args.kwargs["files"]["audio"][0], "input.wav")
+            self.assertEqual(post.call_args.kwargs["timeout"], (15, 120))
+
     def test_request_timeout_is_bounded_and_reported_clearly(self):
         import requests
 

@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import math
+import mimetypes
 import threading
 import msgpack
 import os
@@ -55,7 +56,17 @@ TTS_RETRY_BACKOFF_SECONDS = float(os.getenv("TTS_RETRY_BACKOFF_SECONDS", "2.0"))
 PORT = int(os.getenv("PORT", "10000"))
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-VOICE_CLONE_API_KEY = (os.getenv("VOICE_CLONE_API_KEY") or os.getenv("FISH_API_KEY") or "").strip()
+
+def _configured_voice_clone_api_key() -> str:
+    return (
+        os.getenv("FISH_AUDIO_API_KEY")
+        or os.getenv("VOICE_CLONE_API_KEY")
+        or os.getenv("FISH_API_KEY")
+        or ""
+    ).strip()
+
+
+VOICE_CLONE_API_KEY = _configured_voice_clone_api_key()
 VOICE_CLONE_API_BASE_URL = (
     os.getenv("VOICE_CLONE_API_BASE_URL", "https://api.fish.audio").strip().rstrip("/")
     or "https://api.fish.audio"
@@ -435,8 +446,9 @@ class GeminiTTSRequestError(RuntimeError):
 
 
 class VoiceCloneAPIError(RuntimeError):
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, operation: str = "tts"):
         self.status_code = status_code
+        self.operation = operation
         super().__init__(f"Voice-cloning provider returned HTTP {status_code}")
 
 
@@ -482,6 +494,38 @@ def _generate_voice_clone_audio(
     if "json" in response.headers.get("Content-Type", "").lower():
         raise RuntimeError("Voice-cloning provider returned an error instead of audio")
     return response.content
+
+
+def _transcribe_voice_clone_audio(audio_path: Path) -> str:
+    """Transcribe a voice-note input before synthesizing it in the saved reference voice."""
+    if not VOICE_CLONE_API_KEY:
+        raise VoiceCloneConfigurationError("Voice-cloning API key is not configured")
+    mime_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    with audio_path.open("rb") as audio_file:
+        response = requests.post(
+            f"{VOICE_CLONE_API_BASE_URL}/v1/asr",
+            headers={
+                "Authorization": f"Bearer {VOICE_CLONE_API_KEY}",
+                "model": "transcribe-1-pro",
+            },
+            data={
+                "ignore_timestamps": "true",
+                "tag_audio_events": "false",
+                "diarize": "false",
+            },
+            files={"audio": (audio_path.name, audio_file, mime_type)},
+            timeout=(15, 120),
+        )
+    if not response.ok:
+        raise VoiceCloneAPIError(response.status_code, operation="asr")
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Fish Audio returned an unreadable transcription response") from exc
+    transcript = result.get("text") if isinstance(result, dict) else None
+    if not isinstance(transcript, str) or not transcript.strip():
+        raise ValueError("Fish Audio could not recognize speech in that voice note. Please try a clearer recording.")
+    return transcript.strip()
 
 
 def compile_cloned_voice_to_mp3(
@@ -572,6 +616,20 @@ def validate_voice_clone_sample_duration(duration: float | int | None) -> None:
         raise ValueError(
             f"Please send a clip between {VOICE_CLONE_MIN_AUDIO_SECONDS} and "
             f"{VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
+        )
+
+
+def validate_voice_clone_conversion_duration(duration: float | int | None) -> None:
+    """Voice-note input can be short; only the reference sample requires 10+ seconds."""
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        seconds = float("nan")
+    if not math.isfinite(seconds):
+        raise ValueError("Could not verify the voice-note duration. Please send a supported audio clip.")
+    if not 1 <= seconds <= VOICE_CLONE_MAX_AUDIO_SECONDS:
+        raise ValueError(
+            f"Please send a voice note between 1 and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
         )
 
 
@@ -1023,14 +1081,14 @@ async def send_voice_preview(message, voice: str) -> None:
 
 def tts_failure_message(exc: Exception) -> str:
     if isinstance(exc, VoiceCloneConfigurationError):
-        return "Voice cloning is not configured. Add VOICE_CLONE_API_KEY (or FISH_API_KEY) in Render Environment; do not send API keys in Telegram."
+        return "Voice cloning is not configured. Add FISH_AUDIO_API_KEY in Render Environment; VOICE_CLONE_API_KEY and FISH_API_KEY remain accepted aliases. Do not send API keys in Telegram."
     if isinstance(exc, GeminiTTSRequestError):
         return f"Gemini TTS request {exc.reason}. Please try again in a few minutes."
     if isinstance(exc, VoiceCloneAPIError):
         if exc.status_code in {401, 403}:
-            return "The voice-cloning API key is missing, invalid, or lacks access. Check VOICE_CLONE_API_KEY in Render Environment."
+            return "The Fish Audio API key is missing, invalid, or lacks access. Check FISH_AUDIO_API_KEY in Render Environment."
         if exc.status_code == 402:
-            return "The voice-cloning provider reports no available free-model credit. Confirm VOICE_CLONE_TTS_MODEL is s2.1-pro-free, then check the provider account or wait for its free allowance to return."
+            return "Fish Audio reports that no credit is available for this request. Check the provider account or wait for its allowance to return."
         if exc.status_code == 429:
             return "The voice-cloning provider's free-tier quota or rate limit has been reached. Please wait and try again later."
         if exc.status_code in {500, 502, 503, 504}:
@@ -1038,10 +1096,12 @@ def tts_failure_message(exc: Exception) -> str:
         if exc.status_code == 413:
             return "The voice sample is too large for the provider. Send a shorter or smaller audio clip."
         if exc.status_code == 400:
+            if exc.operation == "asr":
+                return "Fish Audio could not process this voice note. Send a clear audio clip in MP3, WAV, M4A, or Opus format."
             return "The provider rejected this sample or request. Use a clear, single-speaker clip of at least 10 seconds in MP3, WAV, M4A, or Opus format."
         return "The voice-cloning API request failed. Please check the provider settings and try again."
     if isinstance(exc, requests.exceptions.Timeout):
-        return "The voice-cloning provider timed out. Try shorter text or retry in a few minutes."
+        return "The voice-cloning provider timed out. Try a shorter voice note or text, then retry in a few minutes."
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "Could not connect to the voice-cloning provider. Please try again in a few minutes."
     if isinstance(exc, requests.exceptions.RequestException):
@@ -1119,7 +1179,7 @@ async def clonevoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if not VOICE_CLONE_API_KEY:
         await update.message.reply_text(
-            "Voice cloning is not configured yet. Add VOICE_CLONE_API_KEY (or FISH_API_KEY) in Render Environment, then restart the service. Do not send API keys in chat."
+            "Voice cloning is not configured yet. Add FISH_AUDIO_API_KEY in Render Environment, then restart the service. VOICE_CLONE_API_KEY and FISH_API_KEY are still accepted as aliases. Do not send API keys in chat."
         )
         return
     context.user_data["voice_clone_pending_audio"] = True
@@ -1131,6 +1191,7 @@ async def clonevoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Only send your own voice or a voice you have explicit permission to clone. "
         "After uploading, send an accurate, word-for-word transcript of only what is audible in the sample, "
         "including repeated words or code-switching; do not add narration. "
+        "After setup, you can send text or a Burmese voice note. Voice notes are transcribed and then synthesized in the saved voice, so transcription and pronunciation may not be perfect. "
         "The sample is sent with each generation request and is not saved as a provider-side voice model. Use /cancelclone to stop."
     )
 
@@ -1146,6 +1207,99 @@ async def cancelclone_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+async def _handle_voice_clone_conversion(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, attachment, upload_name: str
+) -> None:
+    message = update.message
+    if not message:
+        return
+    max_bytes = VOICE_CLONE_MAX_UPLOAD_MB * 1024 * 1024
+    temp_dir = Path(tempfile.mkdtemp(prefix="telegram-clone-conversion-"))
+    source_path = temp_dir / upload_name
+    audio_path = None
+    voice_note_path = None
+    progress_task = None
+    status_message = await message.reply_text(
+        "Transcribing your Burmese voice note, then synthesizing the recognized words in your saved cloned voice…"
+    )
+    try:
+        telegram_file = await context.bot.get_file(attachment.file_id)
+        await telegram_file.download_to_drive(custom_path=str(source_path))
+        if not source_path.exists() or source_path.stat().st_size == 0:
+            raise RuntimeError("Telegram returned an empty audio file")
+        if source_path.stat().st_size > max_bytes:
+            raise ValueError(f"The downloaded file exceeds the {VOICE_CLONE_MAX_UPLOAD_MB} MB limit")
+        validate_voice_clone_conversion_duration(await asyncio.to_thread(probe_audio_duration, source_path))
+        progress_task = asyncio.create_task(
+            animate_progress(status_message, "Transcribing and generating cloned-voice audio")
+        )
+        await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        recognized_text = await asyncio.to_thread(_transcribe_voice_clone_audio, source_path)
+        recognized_text = normalize_burmese_clone_text(recognized_text)
+        if len(recognized_text) > MAX_TEXT_LENGTH:
+            raise ValueError(
+                f"The recognized speech is too long ({len(recognized_text)} characters). "
+                f"Maximum limit is {MAX_TEXT_LENGTH}."
+            )
+        reference_path = Path(context.user_data["voice_clone_sample_path"])
+        reference_transcript = context.user_data["voice_clone_transcript"]
+        if not reference_path.exists():
+            clear_voice_clone_session(context.user_data)
+            raise ValueError("The temporary reference sample expired. Start again with /clonevoice.")
+        audio_path = await asyncio.to_thread(
+            compile_cloned_voice_to_mp3,
+            recognized_text,
+            reference_path,
+            reference_transcript,
+            current_speed,
+        )
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+        progress_task = None
+        try:
+            voice_note_path = await asyncio.to_thread(convert_to_voice_note, audio_path)
+        except Exception:
+            logger.exception("Could not convert cloned MP3 from voice-note input; sending the MP3 only.")
+        voice_note_sent = False
+        if voice_note_path:
+            try:
+                with voice_note_path.open("rb") as voice_note_file:
+                    await message.reply_voice(
+                        voice=voice_note_file,
+                        caption="Recognized speech synthesized with your cloned voice",
+                    )
+                voice_note_sent = True
+            except Exception:
+                logger.exception("Could not deliver converted voice note; sending the MP3 document instead.")
+        with audio_path.open("rb") as audio_file:
+            await message.reply_document(
+                document=audio_file,
+                filename="cloned-voice-converted.mp3",
+                caption="Recognized speech synthesized with your cloned voice",
+            )
+        result_text = (
+            "Voice note re-spoken in your cloned voice"
+            if voice_note_sent
+            else "Cloned MP3 sent. Telegram voice-note format was unavailable"
+        )
+        await status_message.edit_text(f"{result_text}... {progress_bar(100)}")
+    except Exception as exc:
+        if isinstance(exc, VoiceCloneAPIError):
+            logger.exception("Fish Audio voice-note conversion failed with HTTP %s.", exc.status_code)
+        else:
+            logger.exception("Fish Audio voice-note conversion failed (%s).", type(exc).__name__)
+        await status_message.edit_text(
+            f"Voice-note processing failed... {progress_bar(100)}\n{tts_failure_message(exc)}"
+        )
+    finally:
+        if progress_task:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+        if audio_path:
+            shutil.rmtree(audio_path.parent, ignore_errors=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
@@ -1154,6 +1308,29 @@ async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not message:
         return
     if not context.user_data.get("voice_clone_pending_audio"):
+        if context.user_data.get("voice_clone_pending_transcript"):
+            await message.reply_text("Please send the exact transcript of your reference sample first.")
+            return
+        if context.user_data.get("voice_clone_sample_path") and context.user_data.get("voice_clone_transcript"):
+            if not VOICE_CLONE_API_KEY:
+                await message.reply_text(tts_failure_message(VoiceCloneConfigurationError("missing key")))
+                return
+            attachment, upload_name, duration, error = clone_audio_attachment(message)
+            if error:
+                await message.reply_text(error)
+                return
+            max_bytes = VOICE_CLONE_MAX_UPLOAD_MB * 1024 * 1024
+            if attachment.file_size and attachment.file_size > max_bytes:
+                await message.reply_text(f"That file is too large. The current limit is {VOICE_CLONE_MAX_UPLOAD_MB} MB.")
+                return
+            if duration is not None:
+                try:
+                    validate_voice_clone_conversion_duration(duration)
+                except ValueError as exc:
+                    await message.reply_text(str(exc))
+                    return
+            await _handle_voice_clone_conversion(update, context, attachment, upload_name)
+            return
         await handle_other_message(update, context)
         return
     if not VOICE_CLONE_API_KEY:
@@ -1198,7 +1375,8 @@ async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         keep_sample = True
         await status_message.edit_text(
             "Audio sample is ready. Send only the exact words audible in it, including repetitions or mixed-language words; "
-            "do not add anything that was not spoken. Then send the text to synthesize. Use /cancelclone to remove the local sample."
+            "do not add anything that was not spoken. Then send text to synthesize or send a Burmese voice note to be transcribed and synthesized in the cloned voice. "
+            "Transcription and pronunciation are not guaranteed perfect. Use /cancelclone to remove the local sample."
         )
     except Exception as exc:
         logger.warning("Voice clone setup failed: %s", type(exc).__name__)
@@ -1345,7 +1523,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("voice_clone_pending_transcript", None)
         await update.message.reply_text(
             "Reference transcript saved. Please make sure it matches the uploaded audio word for word. "
-            "Now send the plain text you want spoken in that voice."
+            "Now send text to synthesize, or send a Burmese voice note. Voice notes are transcribed and then synthesized in the cloned voice; transcription and pronunciation may not be perfect."
         )
         return
     clone_sample_path = context.user_data.get("voice_clone_sample_path")
