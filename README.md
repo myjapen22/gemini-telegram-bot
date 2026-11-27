@@ -70,6 +70,12 @@ python bot.py
 - `/start`
 - `/setvoice` — complete Gemini prebuilt voice catalog
 - `/setspeed` — Slow, Normal, Fast
+- `/clonevoice` — optional Fish Audio instant voice cloning; use a clear 15–30 second sample and an exact transcript. Add `VOICE_CLONE_API_KEY` in Render Environment to enable it.
+- `/cancelclone` — remove the temporary clone sample and return to Gemini TTS.
+
+For Burmese clone speech, the bot normalizes Unicode to NFC, tidies whitespace, converts Myanmar digits to standard Arabic digits in synthesis text, and preserves Burmese combining marks and joiners. The reference transcript keeps its original spoken words and digit forms, with spacing cleanup only, so it stays aligned with the uploaded sample. Fish Audio's text rewriter is disabled for clone requests because its documented number-normalization language list does not include Burmese. Synthesis uses the documented `s2.1-pro-free` model and MP3 output at 44.1 kHz / 192 kbps, with the provider's documented sampling defaults.
+
+Pronunciation changes are optional and disabled by default. To replace exact literal text only in synthesized narration (never in the reference transcript), set `VOICE_CLONE_PRONUNCIATION_OVERRIDES` to a JSON object in Render Environment, for example `{"ကျွန်တော်":"ကျနော်"}`. Use only replacements that preserve the intended meaning and test the result with a short sentence.
 
 Messages longer than 4,000 characters are split safely into multiple downloadable MP3 files. Unauthorized users receive a private-bot message and cannot call Gemini.
 

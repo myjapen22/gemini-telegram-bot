@@ -68,6 +68,93 @@ VOICE_CLONE_MAX_AUDIO_SECONDS = max(
 )
 VOICE_CLONE_SPEEDS = {"very_slow": 0.75, "normal": 1.0, "fast": 1.25, "very_fast": 1.5}
 VOICE_CLONE_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".opus", ".ogg", ".oga"}
+VOICE_CLONE_OUTPUT_SAMPLE_RATE = 44100
+VOICE_CLONE_OUTPUT_MP3_BITRATE = 192
+VOICE_CLONE_TEMPERATURE = 0.7
+VOICE_CLONE_TOP_P = 0.7
+VOICE_CLONE_REPETITION_PENALTY = 1.2
+
+
+def _load_voice_clone_pronunciation_overrides(raw_value: str) -> dict[str, str]:
+    """Load optional literal text substitutions; disabled unless configured."""
+    if not raw_value.strip():
+        return {}
+    try:
+        values = json.loads(raw_value)
+    except json.JSONDecodeError:
+        logger.warning("Ignoring invalid VOICE_CLONE_PRONUNCIATION_OVERRIDES JSON.")
+        return {}
+    if not isinstance(values, dict):
+        logger.warning("Ignoring pronunciation overrides: expected a JSON object.")
+        return {}
+    overrides = {}
+    for source, replacement in values.items():
+        if (
+            not isinstance(source, str)
+            or not source.strip()
+            or not isinstance(replacement, str)
+            or not replacement.strip()
+        ):
+            logger.warning("Ignoring invalid pronunciation override entry.")
+            continue
+        overrides[source.strip()] = replacement.strip()
+    return overrides
+
+
+VOICE_CLONE_PRONUNCIATION_OVERRIDES = _load_voice_clone_pronunciation_overrides(
+    os.getenv("VOICE_CLONE_PRONUNCIATION_OVERRIDES", "")
+)
+MYANMAR_DIGIT_TRANSLATION = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
+CLONE_MARKUP_RE = re.compile(r"```|<\|[^|]{1,80}\|>|</?[A-Za-z][^>]{0,200}>")
+
+
+def normalize_burmese_clone_text(
+    text: str,
+    *,
+    apply_pronunciation_overrides: bool = False,
+    normalize_digits: bool = True,
+) -> str:
+    """Normalize representation and spacing without removing Burmese marks."""
+    if not isinstance(text, str):
+        raise ValueError("Please send plain text to synthesize.")
+    cleaned = text.replace("\ufeff", "").replace("\u200b", " ")
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    if CLONE_MARKUP_RE.search(cleaned):
+        raise ValueError(
+            "Clone TTS accepts plain text, not HTML tags, code blocks, or special speaker markup. "
+            "Remove the formatting and resend the text."
+        )
+    for character in cleaned:
+        category = unicodedata.category(character)
+        if (category == "Cc" and character not in "\n\t") or (
+            category == "Cf" and character not in {"\u200c", "\u200d"}
+        ) or category in {"Cs", "Co", "Cn"}:
+            raise ValueError(
+                "The text contains an unsupported control or hidden-format character. "
+                "Remove it and resend plain Burmese or Latin text with ordinary punctuation."
+            )
+    cleaned = unicodedata.normalize("NFC", cleaned)
+    if normalize_digits:
+        cleaned = cleaned.translate(MYANMAR_DIGIT_TRANSLATION)
+    cleaned = re.sub(r"[^\S\n]+", " ", cleaned)
+    cleaned = re.sub(r" +([,;:.!?၊။])", r"\1", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if not cleaned:
+        raise ValueError("Please send non-empty text to synthesize.")
+    if apply_pronunciation_overrides:
+        for source in sorted(VOICE_CLONE_PRONUNCIATION_OVERRIDES, key=len, reverse=True):
+            cleaned = cleaned.replace(source, VOICE_CLONE_PRONUNCIATION_OVERRIDES[source])
+    return cleaned
+
+
+def clean_voice_clone_transcript(transcript: str) -> str:
+    """Clean spacing/Unicode while preserving spoken words and digits exactly."""
+    return normalize_burmese_clone_text(
+        transcript,
+        apply_pronunciation_overrides=False,
+        normalize_digits=False,
+    )
 
 VOICE_CATALOG = [
     ("Achernar", "Female", "Soft"),
@@ -362,11 +449,20 @@ def _generate_voice_clone_audio(
 ) -> bytes:
     if not VOICE_CLONE_API_KEY:
         raise VoiceCloneConfigurationError("Voice-cloning API key is not configured")
+    synthesis_text = normalize_burmese_clone_text(text, apply_pronunciation_overrides=True)
+    cleaned_transcript = clean_voice_clone_transcript(reference_transcript)
     payload = {
-        "text": text,
-        "references": [{"audio": reference_audio, "text": reference_transcript}],
+        "text": synthesis_text,
+        "references": [{"audio": reference_audio, "text": cleaned_transcript}],
         "format": "mp3",
-        "normalize": True,
+        # Fish's documented number-normalization rules do not include Burmese.
+        # Myanmar digits are standardized locally so Fish does not auto-rewrite them.
+        "normalize": False,
+        "sample_rate": VOICE_CLONE_OUTPUT_SAMPLE_RATE,
+        "mp3_bitrate": VOICE_CLONE_OUTPUT_MP3_BITRATE,
+        "temperature": VOICE_CLONE_TEMPERATURE,
+        "top_p": VOICE_CLONE_TOP_P,
+        "repetition_penalty": VOICE_CLONE_REPETITION_PENALTY,
         "prosody": {"speed": VOICE_CLONE_SPEEDS.get(speed, 1.0)},
     }
     response = requests.post(
@@ -1030,8 +1126,11 @@ async def clonevoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         "Send a clear, single-speaker voice note or MP3/WAV/M4A/Opus clip, "
         f"{VOICE_CLONE_MIN_AUDIO_SECONDS}–{VOICE_CLONE_MAX_AUDIO_SECONDS} seconds and up to "
-        f"{VOICE_CLONE_MAX_UPLOAD_MB} MB. Only send your own voice or a voice you have explicit permission to clone. "
-        "Fish Audio's free instant-clone request needs the exact words spoken in the sample; after uploading, send that transcript. "
+        f"{VOICE_CLONE_MAX_UPLOAD_MB} MB. For best results, use 15–30 seconds with one speaker, "
+        "a steady natural speaking voice, and very little background noise. "
+        "Only send your own voice or a voice you have explicit permission to clone. "
+        "After uploading, send an accurate, word-for-word transcript of only what is audible in the sample, "
+        "including repeated words or code-switching; do not add narration. "
         "The sample is sent with each generation request and is not saved as a provider-side voice model. Use /cancelclone to stop."
     )
 
@@ -1098,7 +1197,8 @@ async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.pop("voice_clone_pending_audio", None)
         keep_sample = True
         await status_message.edit_text(
-            "Audio sample is ready. Now send the exact words spoken in that sample. After that, send the text to synthesize. Use /cancelclone to remove the local sample."
+            "Audio sample is ready. Send only the exact words audible in it, including repetitions or mixed-language words; "
+            "do not add anything that was not spoken. Then send the text to synthesize. Use /cancelclone to remove the local sample."
         )
     except Exception as exc:
         logger.warning("Voice clone setup failed: %s", type(exc).__name__)
@@ -1233,12 +1333,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Please send the audio sample first, or use /cancelclone to stop setup.")
         return
     if context.user_data.get("voice_clone_pending_transcript"):
-        if len(text) > MAX_TEXT_LENGTH:
+        try:
+            transcript = clean_voice_clone_transcript(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"Reference transcript issue: {exc}")
+            return
+        if len(transcript) > MAX_TEXT_LENGTH:
             await update.message.reply_text(f"Please keep the reference transcript under {MAX_TEXT_LENGTH} characters.")
             return
-        context.user_data["voice_clone_transcript"] = text
+        context.user_data["voice_clone_transcript"] = transcript
         context.user_data.pop("voice_clone_pending_transcript", None)
-        await update.message.reply_text("Reference transcript saved. Now send the text you want spoken in that voice.")
+        await update.message.reply_text(
+            "Reference transcript saved. Please make sure it matches the uploaded audio word for word. "
+            "Now send the plain text you want spoken in that voice."
+        )
         return
     clone_sample_path = context.user_data.get("voice_clone_sample_path")
     clone_transcript = context.user_data.get("voice_clone_transcript")
@@ -1247,6 +1355,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(
                 f"Text is too long ({len(text)} characters). Maximum limit is {MAX_TEXT_LENGTH}."
             )
+            return
+        try:
+            normalize_burmese_clone_text(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"Text formatting issue; no audio was generated. {exc}")
             return
         sample_path = Path(clone_sample_path)
         if not sample_path.exists():

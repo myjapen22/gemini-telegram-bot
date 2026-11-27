@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 # Keep tests isolated from any real service credentials and make the owner check deterministic.
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:dummy"
-os.environ["GEMINI_API_KEY"] = "dummy"
+os.environ["GEMINI_API_KEY"] = "dummy-gemini-key"
 os.environ["VOICE_CLONE_API_KEY"] = "dummy"
 os.environ["ALLOWED_TELEGRAM_USER_IDS"] = "1"
 os.environ["PORT"] = "0"
@@ -86,6 +86,35 @@ class DurationValidationTests(unittest.TestCase):
         for duration in (7, bot.VOICE_CLONE_MAX_AUDIO_SECONDS + 1, None, float("nan")):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 bot.validate_voice_clone_sample_duration(duration)
+
+
+class BurmeseClonePreprocessingTests(unittest.TestCase):
+    def test_unicode_whitespace_and_myanmar_digits_are_normalized(self):
+        text = "  မင်္ဂလာပါ\t၊\n\n\n ကျန်းမာပါသလား ၁၂၃  "
+        self.assertEqual(
+            bot.normalize_burmese_clone_text(text),
+            "မင်္ဂလာပါ၊\n\nကျန်းမာပါသလား 123",
+        )
+
+    def test_burmese_combining_marks_and_joiners_are_preserved(self):
+        text = "က\u1039\u1000\u103a\u200d\u1001\u200c"
+        self.assertEqual(bot.normalize_burmese_clone_text(text), text)
+
+    def test_optional_pronunciation_overrides_affect_synthesis_only(self):
+        transcript = "ကျွန်တော် နေကောင်းပါတယ်။"
+        with patch.object(
+            bot, "VOICE_CLONE_PRONUNCIATION_OVERRIDES", {"ကျွန်တော်": "ကျနော်"}
+        ):
+            self.assertEqual(
+                bot.normalize_burmese_clone_text(transcript, apply_pronunciation_overrides=True),
+                "ကျနော် နေကောင်းပါတယ်။",
+            )
+            self.assertEqual(bot.clean_voice_clone_transcript(transcript), transcript)
+
+    def test_markup_and_hidden_formatting_are_rejected_with_clear_feedback(self):
+        for text in ("<b>hello</b>", "```python\nhello\n```", "hello\u202e"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                bot.normalize_burmese_clone_text(text)
 
 
 class CloneHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -217,6 +246,42 @@ class CloneHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Text is too long", message.reply_texts[0])
             compile_audio.assert_not_called()
 
+    async def test_unsupported_formatting_is_reported_before_synthesis(self):
+        message = FakeMessage(text="<b>Do not synthesize markup</b>")
+        context = SimpleNamespace(
+            user_data={
+                "voice_clone_sample_path": "/tmp/reference.wav",
+                "voice_clone_transcript": "exact transcript",
+            }
+        )
+        with patch.object(bot, "compile_cloned_voice_to_mp3") as compile_audio:
+            await bot.handle_text(owner_update(message), context)
+
+        self.assertIn("no audio was generated", message.reply_texts[0])
+        self.assertIn("plain text", message.reply_texts[0])
+        compile_audio.assert_not_called()
+
+    async def test_reference_transcript_is_cleaned_but_not_pronunciation_overridden(self):
+        message = FakeMessage(text="  ကျွန်တော်   ၀၁၂\n နေကောင်းပါတယ်။  ")
+        context = SimpleNamespace(user_data={"voice_clone_pending_transcript": True})
+        with patch.object(
+            bot, "VOICE_CLONE_PRONUNCIATION_OVERRIDES", {"ကျွန်တော်": "ကျနော်"}
+        ):
+            await bot.handle_text(owner_update(message), context)
+
+        self.assertEqual(context.user_data["voice_clone_transcript"], "ကျွန်တော် ၀၁၂\nနေကောင်းပါတယ်။")
+        self.assertIn("word for word", message.reply_texts[0])
+
+    async def test_clone_setup_guides_user_to_clear_15_to_30_second_sample(self):
+        message = FakeMessage(text="/clonevoice")
+        context = SimpleNamespace(user_data={})
+        await bot.clonevoice_command(owner_update(message), context)
+
+        guidance = message.reply_texts[0]
+        self.assertIn("15–30 seconds", guidance)
+        self.assertIn("background noise", guidance)
+        self.assertIn("word-for-word transcript", guidance)
+
 
 class FishAudioErrorTests(unittest.TestCase):
     def test_request_timeout_is_bounded_and_reported_clearly(self):
@@ -236,6 +301,31 @@ class FishAudioErrorTests(unittest.TestCase):
                 bot._generate_voice_clone_audio("hello", b"sample", "exact transcript", "normal")
 
         self.assertIn("rate limit", bot.tts_failure_message(raised.exception).lower())
+
+    def test_request_uses_documented_fields_and_cleans_reference_transcript(self):
+        response = SimpleNamespace(
+            ok=True, status_code=200, content=b"mp3 bytes", headers={"Content-Type": "audio/mpeg"}
+        )
+        text = "  မင်္ဂလာပါ ၁၂၃  "
+        transcript = "  နမူနာ   ၀၁၂\n စာသား  "
+        with patch.object(bot.requests, "post", return_value=response) as post:
+            audio = bot._generate_voice_clone_audio(text, b"wav reference", transcript, "normal")
+
+        payload = bot.msgpack.unpackb(post.call_args.kwargs["data"], raw=False)
+        self.assertEqual(audio, b"mp3 bytes")
+        self.assertEqual(payload["text"], "မင်္ဂလာပါ 123")
+        self.assertEqual(payload["references"][0]["audio"], b"wav reference")
+        self.assertEqual(payload["references"][0]["text"], "နမူနာ ၀၁၂\nစာသား")
+        self.assertEqual(payload["format"], "mp3")
+        self.assertFalse(payload["normalize"])
+        self.assertEqual(payload["sample_rate"], 44100)
+        self.assertEqual(payload["mp3_bitrate"], 192)
+        self.assertEqual(payload["temperature"], 0.7)
+        self.assertEqual(payload["top_p"], 0.7)
+        self.assertEqual(payload["repetition_penalty"], 1.2)
+        self.assertEqual(payload["prosody"]["speed"], 1.0)
+        self.assertEqual(post.call_args.kwargs["headers"]["model"], "s2.1-pro-free")
+        self.assertEqual(post.call_args.kwargs["headers"]["Content-Type"], "application/msgpack")
 
 
 if __name__ == "__main__":
