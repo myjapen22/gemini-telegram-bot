@@ -3,3 +3,5 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+elevenlabs_usage.json
+elevenlabs_usage.json.tmp

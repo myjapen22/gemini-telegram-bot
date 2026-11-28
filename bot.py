@@ -2,6 +2,7 @@ import base64
 import asyncio
 import html
 import json
+import hashlib
 import logging
 import math
 import mimetypes
@@ -57,6 +58,118 @@ PORT = int(os.getenv("PORT", "10000"))
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
 
+def _configured_elevenlabs_api_keys() -> list[str]:
+    """Read a comma-separated pool, falling back to the legacy single-key variable."""
+    configured = os.getenv("ELEVENLABS_API_KEYS")
+    if configured and configured.strip():
+        candidates = [item.strip() for item in configured.split(",")]
+    else:
+        candidates = [os.getenv("ELEVENLABS_API_KEY", "").strip()]
+    return list(dict.fromkeys(item for item in candidates if item))
+
+
+ELEVENLABS_API_KEYS = _configured_elevenlabs_api_keys()
+ELEVENLABS_TTS_MODEL = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_v3").strip() or "eleven_v3"
+ELEVENLABS_LOCAL_CHAR_QUOTA_PER_KEY = max(0, int(os.getenv("ELEVENLABS_LOCAL_CHAR_QUOTA_PER_KEY", "10000")))
+ELEVENLABS_USAGE_FILE = Path(
+    os.getenv("ELEVENLABS_USAGE_FILE", "/tmp/elevenlabs_usage.json").strip()
+    or "/tmp/elevenlabs_usage.json"
+)
+ELEVENLABS_KEY_LOCK = threading.RLock()
+ELEVENLABS_USAGE_LOCK = threading.Lock()
+ELEVENLABS_ACTIVE_KEY_INDEX = 0
+
+
+def _utc_usage_period() -> str:
+    return time.strftime("%Y-%m", time.gmtime())
+
+
+def _elevenlabs_key_id(api_key: str) -> str:
+    """Return a stable non-reversible identifier; never persist API key values."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_elevenlabs_usage_locked() -> dict:
+    period = _utc_usage_period()
+    try:
+        state = json.loads(ELEVENLABS_USAGE_FILE.read_text(encoding="utf-8"))
+        if isinstance(state, dict) and state.get("period") == period and isinstance(state.get("keys"), dict):
+            return state
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"period": period, "keys": {}}
+
+
+def _save_elevenlabs_usage_locked(state: dict) -> None:
+    try:
+        ELEVENLABS_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = ELEVENLABS_USAGE_FILE.with_suffix(ELEVENLABS_USAGE_FILE.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(ELEVENLABS_USAGE_FILE)
+    except OSError:
+        logger.warning("Could not persist local ElevenLabs usage estimates.")
+
+
+def record_elevenlabs_usage(api_key: str, characters: int) -> None:
+    if not api_key or characters <= 0:
+        return
+    with ELEVENLABS_USAGE_LOCK:
+        state = _load_elevenlabs_usage_locked()
+        key_id = _elevenlabs_key_id(api_key)
+        state["keys"][key_id] = int(state["keys"].get(key_id, 0)) + int(characters)
+        _save_elevenlabs_usage_locked(state)
+
+
+def elevenlabs_usage_snapshot(active_key_index: int | None = None) -> dict:
+    keys = list(ELEVENLABS_API_KEYS)
+    with ELEVENLABS_KEY_LOCK:
+        selected_index = (
+            ELEVENLABS_ACTIVE_KEY_INDEX if active_key_index is None else active_key_index
+        )
+    if keys:
+        selected_index %= len(keys)
+    else:
+        selected_index = 0
+    with ELEVENLABS_USAGE_LOCK:
+        state = _load_elevenlabs_usage_locked()
+    quota = ELEVENLABS_LOCAL_CHAR_QUOTA_PER_KEY
+    items = []
+    for index, api_key in enumerate(keys):
+        used = max(0, int(state["keys"].get(_elevenlabs_key_id(api_key), 0)))
+        items.append({"index": index, "used": used, "remaining": max(0, quota - used)})
+    total_limit = quota * len(items)
+    total_used = sum(item["used"] for item in items)
+    return {
+        "period": _utc_usage_period(),
+        "active_index": selected_index,
+        "keys": items,
+        "quota_per_key": quota,
+        "total_limit": total_limit,
+        "total_used": total_used,
+        "total_remaining": sum(item["remaining"] for item in items),
+    }
+
+
+def elevenlabs_usage_report(request_characters: int = 0, active_key_index: int | None = None) -> str:
+    snapshot = elevenlabs_usage_snapshot(active_key_index)
+    if not snapshot["keys"]:
+        return (
+            "ElevenLabs အတွက် API key မထည့်ရသေးပါ။ Render Environment တွင် "
+            "ELEVENLABS_API_KEYS သို့မဟုတ် ELEVENLABS_API_KEY ကို ထည့်ပါ။"
+        )
+    active = snapshot["keys"][snapshot["active_index"]]
+    return (
+        f"📊 ယခုတောင်းဆိုမှုတွင် အသုံးပြုထားသည် (local estimate): {request_characters:,} characters\n"
+        f"🔋 လက်ရှိ key အတွက် ခန့်မှန်းကျန်ရှိမှု: {active['remaining']:,} / "
+        f"{snapshot['quota_per_key']:,} characters (Key {active['index'] + 1}/{len(snapshot['keys'])})\n"
+        f"🌐 စုစုပေါင်း local pool ခန့်မှန်းကျန်ရှိမှု: {snapshot['total_remaining']:,} / "
+        f"{snapshot['total_limit']:,} characters ({len(snapshot['keys'])} keys)\n"
+        f"⚠️ ဤကိန်းဂဏန်းများသည် {snapshot['period']} UTC အတွက် bot ၏ local estimate သာဖြစ်ပြီး "
+        "ElevenLabs live balance မဟုတ်ပါ။ 10,000/key သည် ခန့်မှန်းသတ်မှတ်ချက်သာဖြစ်သည်။ "
+        "တူညီသော account မှ key များသည် quota တစ်ခုတည်းကို မျှဝေနိုင်ပြီး pool ပေါင်းလဒ်က အမှန်တကယ် balance ကို မဖော်ပြနိုင်ပါ။"
+    )
+
+
 def _configured_voice_clone_api_key() -> str:
     return (
         os.getenv("FISH_AUDIO_API_KEY")
@@ -77,6 +190,8 @@ VOICE_CLONE_MIN_AUDIO_SECONDS = max(1, int(os.getenv("VOICE_CLONE_MIN_AUDIO_SECO
 VOICE_CLONE_MAX_AUDIO_SECONDS = max(
     VOICE_CLONE_MIN_AUDIO_SECONDS, int(os.getenv("VOICE_CLONE_MAX_AUDIO_SECONDS", "60"))
 )
+ELEVENLABS_MIN_AUDIO_SECONDS = 10
+ELEVENLABS_MAX_AUDIO_SECONDS = 180
 VOICE_CLONE_SPEEDS = {"very_slow": 0.75, "normal": 1.0, "fast": 1.25, "very_fast": 1.5}
 VOICE_CLONE_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".opus", ".ogg", ".oga"}
 VOICE_CLONE_OUTPUT_SAMPLE_RATE = 44100
@@ -346,16 +461,55 @@ async def animate_progress(message, base_text: str, progress_state=None, progres
         pass
 
 
-def welcome_text() -> str:
+ENGINE_LABELS = {
+    "gemini": "Gemini TTS",
+    "elevenlabs": "ElevenLabs Voice Clone & TTS",
+    "fish": "Fish Audio Voice Engine",
+}
+
+
+def active_engine(user_data: dict) -> str:
+    engine = user_data.get("active_tts_engine", "gemini")
+    return engine if engine in ENGINE_LABELS else "gemini"
+
+
+def clear_elevenlabs_pending_session(user_data: dict, *, clear_voice_id: bool = False) -> None:
+    user_data.pop("elevenlabs_pending_audio", None)
+    user_data.pop("elevenlabs_pending_name", None)
+    if clear_voice_id:
+        user_data.pop("elevenlabs_voice_id", None)
+
+
+def select_engine(user_data: dict, engine: str) -> None:
+    if engine not in ENGINE_LABELS:
+        raise ValueError("Unknown TTS engine")
+    if active_engine(user_data) != engine:
+        clear_voice_clone_session(user_data)
+        clear_elevenlabs_pending_session(user_data)
+    user_data["active_tts_engine"] = engine
+
+
+def welcome_text(engine: str = "gemini") -> str:
     return (
-        "<b>Gemini Text-to-Speech Bot</b>\n\n"
+        "<b>Burmese Text-to-Speech Bot</b>\n\n"
+        f"Active engine: <b>{html.escape(ENGINE_LABELS.get(engine, ENGINE_LABELS['gemini']))}</b>\n"
         f"Current Voice: {current_voice} ({VOICES[current_voice]['gender']}, {VOICES[current_voice]['tone']})\n"
-        f"Voice mode: {VOICE_MODES[current_voice_mode]}\n"
+        f"Voice mode: {VOICE_MODES[current_voice_mode]}\n\n"
         f"Current speed: {SPEED_LABELS[current_speed]}\n\n"
         f"Current style: {html.escape(STYLE_NAMES[current_style])}\n\n"
-        "Choose a setting below, then send me any text.\n\n"
-        "Optional voice cloning: /clonevoice, then send a short audio sample. Use /cancelclone to return to Gemini TTS."
+        "Choose an engine below, then send text. Use Settings to adjust Gemini voices and pacing."
     )
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Gemini TTS", callback_data="engine:gemini")],
+        [InlineKeyboardButton("ElevenLabs Voice Clone & TTS", callback_data="engine:elevenlabs")],
+        [InlineKeyboardButton("Fish Audio Voice Engine", callback_data="engine:fish")],
+        [InlineKeyboardButton("Check Remaining Credits / Usage Stats", callback_data="menu:usage")],
+        [InlineKeyboardButton("Help / Guide", callback_data="menu:help")],
+        [InlineKeyboardButton("Gemini Voice / Speed / Style Settings", callback_data="menu:settings")],
+    ])
 
 
 def settings_keyboard() -> InlineKeyboardMarkup:
@@ -368,6 +522,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🎭 Set Style", callback_data="menu:style"),
             InlineKeyboardButton("👥 Voice Mode", callback_data="menu:mode"),
         ],
+        [InlineKeyboardButton("« Engine Menu", callback_data="menu:main")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -454,6 +609,201 @@ class VoiceCloneAPIError(RuntimeError):
 
 class VoiceCloneConfigurationError(RuntimeError):
     pass
+
+
+class ElevenLabsConfigurationError(RuntimeError):
+    pass
+
+
+class ElevenLabsAPIError(RuntimeError):
+    def __init__(self, status_code: int, operation: str, error_code: str = "", message: str = ""):
+        self.status_code = status_code
+        self.operation = operation
+        self.error_code = (error_code or "").lower()
+        self.message = (message or "")[:500]
+        super().__init__(f"ElevenLabs {operation} failed with HTTP {status_code} ({self.error_code})")
+
+
+def _elevenlabs_response_error(response) -> tuple[str, str]:
+    try:
+        payload = response.json()
+    except (ValueError, AttributeError):
+        return "", ""
+    detail = payload.get("detail", payload) if isinstance(payload, dict) else {}
+    if isinstance(detail, dict):
+        code = detail.get("status") or detail.get("code") or detail.get("type") or ""
+        message = detail.get("message") or ""
+        return str(code), str(message)
+    return "", str(detail) if detail else ""
+
+
+def _elevenlabs_should_rotate(error: ElevenLabsAPIError) -> bool:
+    code = error.error_code.replace("-", "_")
+    message = error.message.lower()
+    if error.status_code in {401, 402}:
+        return True
+    if code in {"quota_exceeded", "insufficient_credits"} or "quota_exceeded" in message:
+        return True
+    if error.status_code == 429:
+        if any(token in code or token in message for token in (
+            "concurrent", "too_many_concurrent", "system_busy", "system busy"
+        )):
+            return False
+        return True
+    return False
+
+
+def _elevenlabs_request(url: str, operation: str, **request_kwargs) -> tuple[object, int]:
+    """Try each configured key once only for auth/quota/key-level throttling errors."""
+    global ELEVENLABS_ACTIVE_KEY_INDEX
+    keys = list(ELEVENLABS_API_KEYS)
+    if not keys:
+        raise ElevenLabsConfigurationError(
+            "Add ELEVENLABS_API_KEYS or ELEVENLABS_API_KEY in the Render Environment."
+        )
+    with ELEVENLABS_KEY_LOCK:
+        start_index = ELEVENLABS_ACTIVE_KEY_INDEX % len(keys)
+
+    last_error = None
+    for attempt in range(len(keys)):
+        key_index = (start_index + attempt) % len(keys)
+        multipart_files = request_kwargs.get("files") or {}
+        file_items = multipart_files.values() if isinstance(multipart_files, dict) else multipart_files
+        for file_item in file_items:
+            file_object = file_item[1] if isinstance(file_item, tuple) and len(file_item) > 1 else file_item
+            if hasattr(file_object, "seek"):
+                file_object.seek(0)
+        headers = dict(request_kwargs.get("headers", {}) or {})
+        headers["xi-api-key"] = keys[key_index]
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                **{key: value for key, value in request_kwargs.items() if key != "headers"},
+            )
+        except requests.exceptions.RequestException:
+            raise
+        if response.ok:
+            with ELEVENLABS_KEY_LOCK:
+                ELEVENLABS_ACTIVE_KEY_INDEX = key_index
+            return response, key_index
+        error_code, error_message = _elevenlabs_response_error(response)
+        last_error = ElevenLabsAPIError(
+            response.status_code, operation, error_code=error_code, message=error_message
+        )
+        if not _elevenlabs_should_rotate(last_error) or attempt + 1 >= len(keys):
+            break
+        logger.warning(
+            "ElevenLabs %s returned HTTP %s (%s); trying configured key %s of %s.",
+            operation,
+            response.status_code,
+            error_code or "provider error",
+            attempt + 2,
+            len(keys),
+        )
+    raise last_error
+
+
+def _generate_elevenlabs_audio(text: str, voice_id: str) -> tuple[bytes, int]:
+    cleaned_text = normalize_burmese_clone_text(text)
+    response, key_index = _elevenlabs_request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        "tts",
+        params={"output_format": "mp3_44100_128"},
+        json={
+            "text": cleaned_text,
+            "model_id": ELEVENLABS_TTS_MODEL,
+            "language_code": "my",
+        },
+        timeout=(15, 120),
+    )
+    if not response.content:
+        raise RuntimeError("ElevenLabs returned an empty audio file.")
+    record_elevenlabs_usage(ELEVENLABS_API_KEYS[key_index], len(cleaned_text))
+    return response.content, key_index
+
+
+def transcode_elevenlabs_sample(source_path: Path, target_path: Path) -> None:
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(source_path), "-ac", "1",
+         "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "192k", str(target_path)],
+        check=True,
+        timeout=45,
+    )
+    if not target_path.exists() or target_path.stat().st_size == 0:
+        raise RuntimeError("Audio conversion produced an empty MP3 sample.")
+
+
+def create_elevenlabs_voice(sample_path: Path) -> tuple[str, bool]:
+    if not ELEVENLABS_API_KEYS:
+        raise ElevenLabsConfigurationError(
+            "Add ELEVENLABS_API_KEYS or ELEVENLABS_API_KEY in the Render Environment."
+        )
+    mp3_path = sample_path.with_name("elevenlabs-reference.mp3")
+    transcode_elevenlabs_sample(sample_path, mp3_path)
+    try:
+        with mp3_path.open("rb") as sample_file:
+            response, _ = _elevenlabs_request(
+                "https://api.elevenlabs.io/v1/voices/add",
+                "voice clone",
+                data={"name": f"Telegram Burmese clone {int(time.time() * 1000)}"},
+                files={"files": (mp3_path.name, sample_file, "audio/mpeg")},
+                timeout=(15, 120),
+            )
+    finally:
+        mp3_path.unlink(missing_ok=True)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("ElevenLabs returned an unreadable voice-clone response.") from exc
+    voice_id = payload.get("voice_id") if isinstance(payload, dict) else None
+    if not isinstance(voice_id, str) or not voice_id.strip():
+        raise RuntimeError("ElevenLabs did not return a voice ID for the cloned sample.")
+    return voice_id.strip(), bool(payload.get("requires_verification", False))
+
+
+def compile_elevenlabs_to_mp3(
+    text: str, voice_id: str, progress_callback=None
+) -> tuple[Path, int]:
+    cleaned_text = normalize_burmese_clone_text(text)
+    chunks = split_text_for_tts(cleaned_text)
+    if not chunks:
+        raise ValueError("Text contains no speakable lines.")
+    master_dir = Path(tempfile.mkdtemp(prefix="telegram-elevenlabs-"))
+    segment_paths: list[Path] = []
+    last_key_index = 0
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            if index > 1 and TTS_INTER_SEGMENT_DELAY_SECONDS > 0:
+                time.sleep(TTS_INTER_SEGMENT_DELAY_SECONDS)
+            audio_bytes, last_key_index = _generate_elevenlabs_audio(chunk, voice_id)
+            segment_path = master_dir / f"segment_{index:04d}.mp3"
+            segment_path.write_bytes(audio_bytes)
+            segment_paths.append(segment_path)
+            if progress_callback:
+                progress_callback(index, len(chunks))
+        output_path = master_dir / "elevenlabs-voiceover.mp3"
+        if len(segment_paths) == 1:
+            segment_paths[0].replace(output_path)
+        else:
+            concat_list = master_dir / "concat.txt"
+            concat_list.write_text(
+                "\n".join(f"file '{path.name}'" for path in segment_paths) + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                 "-i", str(concat_list), "-c:a", "libmp3lame", "-b:a", "128k", "-vn", str(output_path)],
+                check=True,
+                timeout=max(120, 30 * len(segment_paths)),
+                cwd=master_dir,
+            )
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg produced an empty ElevenLabs MP3.")
+        return output_path, last_key_index
+    except Exception:
+        shutil.rmtree(master_dir, ignore_errors=True)
+        raise
 
 
 def _generate_voice_clone_audio(
@@ -630,6 +980,20 @@ def validate_voice_clone_conversion_duration(duration: float | int | None) -> No
     if not 1 <= seconds <= VOICE_CLONE_MAX_AUDIO_SECONDS:
         raise ValueError(
             f"Please send a voice note between 1 and {VOICE_CLONE_MAX_AUDIO_SECONDS} seconds long."
+        )
+
+
+def validate_elevenlabs_sample_duration(duration: float | int | None) -> None:
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        seconds = float("nan")
+    if not math.isfinite(seconds):
+        raise ValueError("Could not verify the audio duration. Please send a supported audio clip.")
+    if not ELEVENLABS_MIN_AUDIO_SECONDS <= seconds <= ELEVENLABS_MAX_AUDIO_SECONDS:
+        raise ValueError(
+            f"Please send a clear sample between {ELEVENLABS_MIN_AUDIO_SECONDS} and "
+            f"{ELEVENLABS_MAX_AUDIO_SECONDS} seconds. For best results, use about 1–2 minutes."
         )
 
 
@@ -1123,14 +1487,93 @@ def tts_failure_message(exc: Exception) -> str:
     return f"Failed to generate speech: {str(exc)}"
 
 
+def elevenlabs_failure_message(exc: Exception) -> str:
+    if isinstance(exc, ElevenLabsConfigurationError):
+        return "ElevenLabs key မထည့်ရသေးပါ။ Render Environment တွင် ELEVENLABS_API_KEYS (comma-separated) သို့မဟုတ် ELEVENLABS_API_KEY ကို ထည့်ပါ။ Key များကို Telegram chat ထဲ မပို့ပါနှင့်။"
+    if isinstance(exc, ElevenLabsAPIError):
+        code = exc.error_code.replace("-", "_")
+        if code == "quota_exceeded" or exc.status_code == 402:
+            return "ElevenLabs account ၏ credit/quota မလုံလောက်ပါ။ Key pool ထဲက key များကို တစ်ကြိမ်စီ စမ်းပြီးပါပြီ။ Key အများအပြားသည် account တစ်ခုတည်းနှင့် quota မျှဝေနိုင်ကြောင်း သတိပြုပါ။"
+        if exc.status_code == 401:
+            return "ElevenLabs key များအားလုံးကို အတည်ပြုမရပါ (HTTP 401)။ Render Environment ထဲရှိ key များမှန်ကန်မှုနှင့် API access ကို စစ်ဆေးပါ။"
+        if exc.status_code == 403:
+            return "ဤ ElevenLabs လုပ်ဆောင်ချက်အတွက် permission မရှိပါ။ Instant Voice Cloning သုံးရန် Starter plan သို့မဟုတ် အထက်လိုအပ်နိုင်ပြီး API key တွင် သက်ဆိုင်ရာ permission ပါရပါမည်။"
+        if exc.status_code == 429:
+            return "ElevenLabs rate/concurrency limit သို့မဟုတ် service busy ဖြစ်နေပါသည်။ တူညီသော subscription key များလဲခြင်းဖြင့် limit ကို မကျော်နိုင်ပါ။ ခဏစောင့်ပြီး ထပ်စမ်းပါ။"
+        if code == "max_character_limit_exceeded":
+            return "ဤ TTS request သည် မော်ဒယ်၏ စာလုံးအများဆုံးကန့်သတ်ချက်ကို ကျော်နေပါသည်။ စာသားကို ပိုတိုအောင် ခွဲပို့ပါ။"
+        if exc.status_code == 400 and code == "feature_not_available":
+            return "သင့် ElevenLabs plan တွင် ဤ feature မပါဝင်သေးပါ။ Plan နှင့် API access ကို စစ်ဆေးပါ။"
+        return f"ElevenLabs API request မအောင်မြင်ပါ (HTTP {exc.status_code})။ Key permission နှင့် provider status ကို စစ်ဆေးပြီး ပြန်စမ်းပါ။"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "ElevenLabs တုံ့ပြန်မှု နောက်ကျနေပါသည်။ ခဏကြာပြီး ပြန်စမ်းပါ။"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "ElevenLabs သို့ ချိတ်ဆက်မရပါ။ ခဏကြာပြီး ပြန်စမ်းပါ။"
+    if isinstance(exc, requests.exceptions.RequestException):
+        return "ElevenLabs request မအောင်မြင်ပါ။ ခဏကြာပြီး ပြန်စမ်းပါ။"
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return "ElevenLabs TTS/voice clone မအောင်မြင်ပါ။ ခဏကြာပြီး ပြန်စမ်းပါ။"
+
+
+def fish_clone_prompt() -> str:
+    return (
+        "Fish Audio voice ကို စတင် clone လုပ်ရန် ကိုယ်ပိုင်အသံ သို့မဟုတ် clone လုပ်ခွင့်ရထားသော "
+        "အသံတစ်ခု၏ Telegram voice note သို့မဟုတ် MP3/WAV/M4A/Opus clip ကို ပို့ပါ။ "
+        f"ကြာချိန် {VOICE_CLONE_MIN_AUDIO_SECONDS}–{VOICE_CLONE_MAX_AUDIO_SECONDS} seconds နှင့် "
+        f"အရွယ်အစား {VOICE_CLONE_MAX_UPLOAD_MB} MB အောက် ဖြစ်ရပါမည်။ အကောင်းဆုံးရလဒ်အတွက် "
+        "15–30 seconds, one speaker, steady natural voice, and very little background noise ကို ရွေးပါ။ "
+        "Sample ပြီးနောက် အမှန်တကယ်ကြားရသော စကားလုံးများကို exact word-for-word transcript အဖြစ် ပို့ပါ။ "
+        "Setup ပြီးနောက် text သို့မဟုတ် Burmese voice note ပို့နိုင်ပါသည်။ ရပ်ရန် သို့မဟုတ် engine ပြောင်းရန် "
+        "/start ကိုနှိပ်ပြီး မီနူးမှ အခြား engine ကို ရွေးပါ။"
+    )
+
+
+def begin_fish_clone_setup(user_data: dict) -> str:
+    select_engine(user_data, "fish")
+    clear_voice_clone_session(user_data)
+    if not VOICE_CLONE_API_KEY:
+        return "Fish Audio ကို မပြင်ဆင်ရသေးပါ။ Render Environment တွင် FISH_AUDIO_API_KEY ထည့်ပါ။"
+    user_data["voice_clone_pending_audio"] = True
+    return fish_clone_prompt()
+
+
+def begin_elevenlabs_clone_setup(user_data: dict) -> str:
+    select_engine(user_data, "elevenlabs")
+    if not ELEVENLABS_API_KEYS:
+        user_data.pop("elevenlabs_pending_audio", None)
+        return elevenlabs_failure_message(ElevenLabsConfigurationError("missing key"))
+    user_data["elevenlabs_pending_audio"] = True
+    user_data.pop("elevenlabs_pending_name", None)
+    return (
+        "ElevenLabs Instant Voice Clone အတွက် ကိုယ်ပိုင်အသံ သို့မဟုတ် clone လုပ်ခွင့်ရထားသော "
+        "အသံ၏ 10–180 စက္ကန့် sample ပို့ပါ။ ပိုကောင်းသော clone အတွက် ဆူညံသံမရှိ၊ "
+        "တစ်ယောက်တည်း တည်ငြိမ်စွာပြောထားသော 1–2 မိနစ်ကို အကြံပြုပါသည်။ Sample ကို ElevenLabs သို့ "
+        "ပို့ပြီး account ထဲတွင် voice အသစ်တစ်ခု ဖန်တီးမည်ဖြစ်သည်။ ထိုအသံကို clone လုပ်ရန် "
+        "သင့်တွင် ခွင့်ပြုချက်ရှိကြောင်း ပို့ခြင်းဖြင့် အတည်ပြုပါ။ Instant Voice Cloning သည် "
+        "ElevenLabs Starter plan သို့မဟုတ် အထက်လိုအပ်သည်။"
+    )
+
+
+def help_guide_text() -> str:
+    return (
+        "<b>အသုံးပြုပုံ</b>\n"
+        "• Gemini TTS: Gemini 30-voice, style, speed နှင့် single/multi-speaker များကို အသုံးပြုပါ။\n"
+        "• ElevenLabs: Eleven v3 ဖြင့် Burmese TTS; Voice Clone ရွေးပြီး အသံ sample တင်ကာ ပြီးလျှင် text ပို့ပါ။ Instant Voice Cloning အတွက် Starter plan သို့မဟုတ် အထက်လိုအပ်သည်။\n"
+        "• Fish Audio: အသံနမူနာနှင့် တိကျသော transcript ပေးပါ။ Voice note ကို စာသားအဖြစ် ပြောင်းပြီးမှ clone အသံဖြင့် ပြန်ဖန်တီးမည်။\n"
+        "• Usage Stats သည် ElevenLabs အသုံးပြုမှု၏ bot-local estimate သာဖြစ်ပြီး provider ၏ real-time balance မဟုတ်ပါ။\n"
+        "• /start သည် မီနူးကို ပြန်ဖွင့်သည်။ /clonevoice နှင့် /cancelclone legacy command များလည်း အလုပ်လုပ်နေဆဲဖြစ်သည်။"
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
         return
     if update.message:
         await update.message.reply_text(
-            welcome_text(),
-            reply_markup=settings_keyboard(),
+            welcome_text(active_engine(context.user_data)),
+            reply_markup=main_menu_keyboard(),
             parse_mode="HTML"
         )
 
@@ -1177,23 +1620,7 @@ async def clonevoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if not update.message:
         return
-    if not VOICE_CLONE_API_KEY:
-        await update.message.reply_text(
-            "Voice cloning is not configured yet. Add FISH_AUDIO_API_KEY in Render Environment, then restart the service. VOICE_CLONE_API_KEY and FISH_API_KEY are still accepted as aliases. Do not send API keys in chat."
-        )
-        return
-    context.user_data["voice_clone_pending_audio"] = True
-    await update.message.reply_text(
-        "Send a clear, single-speaker voice note or MP3/WAV/M4A/Opus clip, "
-        f"{VOICE_CLONE_MIN_AUDIO_SECONDS}–{VOICE_CLONE_MAX_AUDIO_SECONDS} seconds and up to "
-        f"{VOICE_CLONE_MAX_UPLOAD_MB} MB. For best results, use 15–30 seconds with one speaker, "
-        "a steady natural speaking voice, and very little background noise. "
-        "Only send your own voice or a voice you have explicit permission to clone. "
-        "After uploading, send an accurate, word-for-word transcript of only what is audible in the sample, "
-        "including repeated words or code-switching; do not add narration. "
-        "After setup, you can send text or a Burmese voice note. Voice notes are transcribed and then synthesized in the saved voice, so transcription and pronunciation may not be perfect. "
-        "The sample is sent with each generation request and is not saved as a provider-side voice model. Use /cancelclone to stop."
-    )
+    await update.message.reply_text(begin_fish_clone_setup(context.user_data))
 
 
 async def cancelclone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1201,9 +1628,11 @@ async def cancelclone_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reject_unauthorized(update)
         return
     clear_voice_clone_session(context.user_data)
+    clear_elevenlabs_pending_session(context.user_data, clear_voice_id=True)
+    context.user_data.pop("active_tts_engine", None)
     if update.message:
         await update.message.reply_text(
-            "Cloned-voice mode is off. The temporary sample was removed from this bot instance. New text will use the existing Gemini TTS behavior."
+            "Clone mode is off. Local sample/session state was cleared. New text uses the existing Gemini TTS behavior."
         )
 
 
@@ -1245,7 +1674,7 @@ async def _handle_voice_clone_conversion(
         reference_transcript = context.user_data["voice_clone_transcript"]
         if not reference_path.exists():
             clear_voice_clone_session(context.user_data)
-            raise ValueError("The temporary reference sample expired. Start again with /clonevoice.")
+            raise ValueError("The temporary reference sample expired. Choose Fish Audio from /start and upload it again.")
         audio_path = await asyncio.to_thread(
             compile_cloned_voice_to_mp3,
             recognized_text,
@@ -1300,12 +1729,85 @@ async def _handle_voice_clone_conversion(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+async def handle_elevenlabs_clone_audio(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Handle an ElevenLabs clone upload; return False when another engine owns audio."""
+    if active_engine(context.user_data) != "elevenlabs":
+        return False
+    message = update.message
+    if not message:
+        return True
+    if not context.user_data.get("elevenlabs_pending_audio"):
+        await message.reply_text(
+            "ElevenLabs engine active ပါသည်။ Text ပို့၍ အသံဖန်တီးပါ၊ သို့မဟုတ် /start မှ "
+            "ElevenLabs ကို ရွေးပြီး Clone Voice လုပ်ရန် sample အသစ်ပို့ပါ။"
+        )
+        return True
+    if not ELEVENLABS_API_KEYS:
+        context.user_data.pop("elevenlabs_pending_audio", None)
+        await message.reply_text(elevenlabs_failure_message(ElevenLabsConfigurationError("missing key")))
+        return True
+    attachment, upload_name, duration, error = clone_audio_attachment(message)
+    if error:
+        await message.reply_text(error)
+        return True
+    max_bytes = VOICE_CLONE_MAX_UPLOAD_MB * 1024 * 1024
+    if attachment.file_size and attachment.file_size > max_bytes:
+        await message.reply_text(f"Audio file is too large. Limit: {VOICE_CLONE_MAX_UPLOAD_MB} MB.")
+        return True
+    if duration is not None:
+        try:
+            validate_elevenlabs_sample_duration(duration)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return True
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="telegram-elevenlabs-clone-"))
+    source_path = temp_dir / upload_name
+    status_message = await message.reply_text(
+        "ElevenLabs ကို voice sample ပို့ပြီး clone ဖန်တီးနေပါသည်…"
+    )
+    try:
+        telegram_file = await context.bot.get_file(attachment.file_id)
+        await telegram_file.download_to_drive(custom_path=str(source_path))
+        if not source_path.exists() or source_path.stat().st_size == 0:
+            raise RuntimeError("Telegram returned an empty audio file.")
+        if source_path.stat().st_size > max_bytes:
+            raise ValueError(f"The downloaded audio exceeds the {VOICE_CLONE_MAX_UPLOAD_MB} MB limit.")
+        measured_duration = await asyncio.to_thread(probe_audio_duration, source_path)
+        validate_elevenlabs_sample_duration(measured_duration)
+        voice_id, requires_verification = await asyncio.to_thread(create_elevenlabs_voice, source_path)
+        context.user_data["elevenlabs_voice_id"] = voice_id
+        context.user_data.pop("elevenlabs_pending_audio", None)
+        if requires_verification:
+            await status_message.edit_text(
+                "ElevenLabs clone တင်ပြီးပါပြီ၊ သို့သော် provider verification လိုအပ်နိုင်သည်။ "
+                "Voice အသုံးပြုခွင့်ရပြီးနောက် /start မှ ElevenLabs ကို ရွေးပြီး text ပို့ပါ။"
+            )
+        else:
+            await status_message.edit_text(
+                "ElevenLabs voice clone အသင့်ဖြစ်ပါပြီ။ ယခု မြန်မာစာသားပို့ပြီး TTS ဖန်တီးနိုင်ပါသည်။"
+            )
+    except Exception as exc:
+        if isinstance(exc, ElevenLabsAPIError):
+            logger.warning("ElevenLabs voice clone failed with HTTP %s (%s).", exc.status_code, exc.error_code)
+        else:
+            logger.warning("ElevenLabs voice clone failed (%s).", type(exc).__name__)
+        await status_message.edit_text(f"ElevenLabs clone မအောင်မြင်ပါ။ {elevenlabs_failure_message(exc)}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return True
+
+
 async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
         return
     message = update.message
     if not message:
+        return
+    if await handle_elevenlabs_clone_audio(update, context):
         return
     if not context.user_data.get("voice_clone_pending_audio"):
         if context.user_data.get("voice_clone_pending_transcript"):
@@ -1376,7 +1878,7 @@ async def clone_audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_message.edit_text(
             "Audio sample is ready. Send only the exact words audible in it, including repetitions or mixed-language words; "
             "do not add anything that was not spoken. Then send text to synthesize or send a Burmese voice note to be transcribed and synthesized in the cloned voice. "
-            "Transcription and pronunciation are not guaranteed perfect. Use /cancelclone to remove the local sample."
+            "Transcription and pronunciation are not guaranteed perfect. To stop or switch engines, open /start and select another engine."
         )
     except Exception as exc:
         logger.warning("Voice clone setup failed: %s", type(exc).__name__)
@@ -1401,9 +1903,87 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data or ""
     if data == "menu:main":
         await query.edit_message_text(
-            welcome_text(),
-            reply_markup=settings_keyboard(),
+            welcome_text(active_engine(context.user_data)),
+            reply_markup=main_menu_keyboard(),
             parse_mode="HTML"
+        )
+    elif data == "menu:settings":
+        await query.edit_message_text(
+            welcome_text(active_engine(context.user_data)),
+            reply_markup=settings_keyboard(),
+            parse_mode="HTML",
+        )
+    elif data == "menu:usage":
+        await query.edit_message_text(
+            elevenlabs_usage_report(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Main Menu", callback_data="menu:main")]]),
+        )
+    elif data == "menu:help":
+        await query.edit_message_text(
+            help_guide_text(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Main Menu", callback_data="menu:main")]]),
+            parse_mode="HTML",
+        )
+    elif data in {"engine:gemini", "engine:elevenlabs", "engine:fish"}:
+        engine = data.split(":", 1)[1]
+        select_engine(context.user_data, engine)
+        if engine == "gemini":
+            await query.edit_message_text(
+                welcome_text("gemini"), reply_markup=main_menu_keyboard(), parse_mode="HTML"
+            )
+        elif engine == "elevenlabs":
+            voice_id = context.user_data.get("elevenlabs_voice_id")
+            if not ELEVENLABS_API_KEYS:
+                await query.edit_message_text(
+                    elevenlabs_failure_message(ElevenLabsConfigurationError("missing key")),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("« Main Menu", callback_data="menu:main")]
+                    ]),
+                )
+            elif voice_id:
+                await query.edit_message_text(
+                    "ElevenLabs TTS အသင့်ဖြစ်ပါသည်။ မြန်မာစာသားပို့၍ clone voice ဖြင့် အသံဖန်တီးပါ။",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Clone / Replace Voice", callback_data="eleven:clone")],
+                        [InlineKeyboardButton("« Main Menu", callback_data="menu:main")],
+                    ]),
+                )
+            else:
+                await query.edit_message_text(
+                    begin_elevenlabs_clone_setup(context.user_data),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("« Main Menu", callback_data="menu:main")]
+                    ]),
+                )
+        else:
+            if context.user_data.get("voice_clone_sample_path") and context.user_data.get("voice_clone_transcript"):
+                await query.edit_message_text(
+                    "Fish Audio အသံ clone အသင့်ဖြစ်ပါသည်။ Text သို့မဟုတ် Burmese voice note ပို့ပါ။",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Replace Fish Audio Sample", callback_data="fish:clone")],
+                        [InlineKeyboardButton("« Main Menu", callback_data="menu:main")],
+                    ]),
+                )
+            else:
+                await query.edit_message_text(
+                    begin_fish_clone_setup(context.user_data),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("« Main Menu", callback_data="menu:main")]
+                    ]),
+                )
+    elif data == "eleven:clone":
+        await query.edit_message_text(
+            begin_elevenlabs_clone_setup(context.user_data),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("« Main Menu", callback_data="menu:main")]
+            ]),
+        )
+    elif data == "fish:clone":
+        await query.edit_message_text(
+            begin_fish_clone_setup(context.user_data),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("« Main Menu", callback_data="menu:main")]
+            ]),
         )
     elif data == "menu:voice":
         await query.edit_message_text(
@@ -1497,6 +2077,96 @@ async def _show_invalid_callback(query) -> None:
         logger.info("Could not refresh an expired or invalid menu callback.")
 
 
+async def handle_elevenlabs_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    message = update.message
+    if not message:
+        return
+    if context.user_data.get("elevenlabs_pending_audio"):
+        await message.reply_text("Voice clone စတင်ရန် ကိုယ်ပိုင်အသံ သို့မဟုတ် ခွင့်ပြုချက်ရထားသော audio sample ကို အရင်ပို့ပါ။")
+        return
+    if not ELEVENLABS_API_KEYS:
+        await message.reply_text(elevenlabs_failure_message(ElevenLabsConfigurationError("missing key")))
+        return
+    voice_id = context.user_data.get("elevenlabs_voice_id")
+    if not voice_id:
+        await message.reply_text(begin_elevenlabs_clone_setup(context.user_data))
+        return
+    if len(text) > MAX_TEXT_LENGTH:
+        await message.reply_text(
+            f"Text too long ({len(text)} characters). Maximum is {MAX_TEXT_LENGTH}."
+        )
+        return
+    try:
+        cleaned_text = normalize_burmese_clone_text(text)
+        spoken_text = " ".join(segment for _, segment in parse_script(cleaned_text)).strip()
+        spoken_text = normalize_burmese_clone_text(spoken_text)
+    except ValueError as exc:
+        await message.reply_text(f"Text formatting issue; no audio was generated. {exc}")
+        return
+    chunks = split_text_for_tts(spoken_text)
+    if not chunks:
+        await message.reply_text("Please send non-empty text to generate speech.")
+        return
+    request_characters = sum(len(chunk) for chunk in chunks)
+    status_message = await message.reply_text(
+        f"ElevenLabs Eleven v3 TTS generating… {progress_bar(5)}"
+    )
+    progress_state = {"completed": 0, "total": len(chunks)}
+    progress_lock = threading.Lock()
+
+    def record_segment_progress(completed: int, total: int) -> None:
+        with progress_lock:
+            progress_state["completed"] = completed
+            progress_state["total"] = total
+
+    progress_task = asyncio.create_task(
+        animate_progress(status_message, "ElevenLabs TTS", progress_state, progress_lock)
+    )
+    audio_path = None
+    voice_note_path = None
+    active_index = None
+    try:
+        await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        audio_path, active_index = await asyncio.to_thread(
+            compile_elevenlabs_to_mp3, spoken_text, voice_id, record_segment_progress
+        )
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+        progress_task = None
+        try:
+            voice_note_path = await asyncio.to_thread(convert_to_voice_note, audio_path)
+        except Exception:
+            logger.info("ElevenLabs voice-note conversion unavailable; MP3 delivery will continue.")
+        if voice_note_path:
+            try:
+                with voice_note_path.open("rb") as voice_file:
+                    await message.reply_voice(voice=voice_file, caption="ElevenLabs Burmese voice clone")
+            except Exception:
+                logger.info("ElevenLabs voice-note upload unavailable; MP3 delivery will continue.")
+        with audio_path.open("rb") as audio_file:
+            await message.reply_document(
+                document=audio_file,
+                filename="elevenlabs-voiceover.mp3",
+                caption="ElevenLabs Eleven v3 Burmese TTS",
+            )
+        report = elevenlabs_usage_report(request_characters, active_index)
+        await status_message.edit_text(f"ElevenLabs audio ပို့ပြီးပါပြီ။ {progress_bar(100)}\n\n{report}")
+    except Exception as exc:
+        if progress_task:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+        if isinstance(exc, ElevenLabsAPIError):
+            logger.warning("ElevenLabs TTS failed with HTTP %s (%s).", exc.status_code, exc.error_code)
+        else:
+            logger.warning("ElevenLabs TTS failed (%s).", type(exc).__name__)
+        await status_message.edit_text(
+            f"ElevenLabs audio မအောင်မြင်ပါ။ {elevenlabs_failure_message(exc)}"
+        )
+    finally:
+        if audio_path:
+            shutil.rmtree(audio_path.parent, ignore_errors=True)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await reject_unauthorized(update)
@@ -1507,8 +2177,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.strip()
     if not text:
         return
+    if active_engine(context.user_data) == "elevenlabs":
+        await handle_elevenlabs_text(update, context, text)
+        return
     if context.user_data.get("voice_clone_pending_audio"):
-        await update.message.reply_text("Please send the audio sample first, or use /cancelclone to stop setup.")
+        await update.message.reply_text("Please send the audio sample first, or open /start and select another engine to stop setup.")
         return
     if context.user_data.get("voice_clone_pending_transcript"):
         try:
@@ -1542,7 +2215,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sample_path = Path(clone_sample_path)
         if not sample_path.exists():
             clear_voice_clone_session(context.user_data)
-            await update.message.reply_text("The temporary voice sample has expired. Start again with /clonevoice.")
+            await update.message.reply_text("The temporary voice sample has expired. Choose Fish Audio from /start and upload it again.")
             return
         status_message = await update.message.reply_text(
             f"Generating speech with your private cloned voice... {progress_bar(5)}"
@@ -1758,7 +2431,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("setspeed", setspeed_command))
     application.add_handler(CommandHandler("clonevoice", clonevoice_command))
     application.add_handler(CommandHandler("cancelclone", cancelclone_command))
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^(menu|voice|speed|style|mode|confirm|back):"))
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_handler,
+            pattern=r"^(menu|engine|voice|speed|style|mode|eleven|fish|confirm|back):",
+        )
+    )
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.ALL, clone_audio_handler)
     )
@@ -1777,5 +2455,6 @@ if __name__ == "__main__":
 
     start_health_server()
     app = build_application()
+    logger.info("ElevenLabs API key pool loaded: %s key(s).", len(ELEVENLABS_API_KEYS))
     logger.info("Bot is starting polling...")
     app.run_polling()

@@ -1,6 +1,6 @@
 # Telegram Gemini Text-to-Speech Bot
 
-Private Telegram bot using Google Gemini TTS. It generates Burmese or multilingual audio, converts Gemini WAV output to downloadable MP3 files with FFmpeg, and sends them through Telegram's standard audio upload.
+Private Telegram bot with Gemini TTS, ElevenLabs Burmese TTS/Instant Voice Cloning, and Fish Audio cloning. It converts audio with FFmpeg and delivers voice notes plus downloadable MP3 files through Telegram.
 
 ## Render free web-service mode
 
@@ -27,13 +27,22 @@ GEMINI_FALLBACK_MODEL=gemini-3.8-flash-lite-tts
 DEFAULT_VOICE=Kore
 DEFAULT_SPEED=normal
 MAX_TEXT_LENGTH=4000
+# Optional ElevenLabs. Prefer a comma-separated pool; the single key is a fallback.
+ELEVENLABS_API_KEYS=<key-1>,<key-2>
+# ELEVENLABS_API_KEY=<single-key-fallback>
+ELEVENLABS_TTS_MODEL=eleven_v3
+ELEVENLABS_LOCAL_CHAR_QUOTA_PER_KEY=10000
 ```
+
+`ELEVENLABS_API_KEYS` supports any number of comma-separated keys and takes precedence over `ELEVENLABS_API_KEY`. Keep key values only in Render's **Environment** settings; do not commit them or send them in Telegram. Startup logs print the key count only. The bot tries another key for invalid-key and quota/credit errors, and for key-level rate limits; it does not rotate on provider-busy or subscription concurrency errors because another key from the same account cannot resolve those.
+
+ElevenLabs' current API pricing lists 10,000 monthly characters for the Free tier for v3 TTS, but this is an account/subscription allowance, not 10,000 characters for each API key. ElevenLabs Instant Voice Cloning requires Starter or above. The bot's **Check Remaining Credits / Usage Stats** button performs no provider call: it reports bot-local characters sent through each key, using `ELEVENLABS_LOCAL_CHAR_QUOTA_PER_KEY` (default `10000`) as a configurable estimate. It is not a live provider balance; keys on the same account can share a quota, and the summed pool can overstate real available usage. Counters are kept in `/tmp/elevenlabs_usage.json`, reset at UTC month boundaries, and may be lost when Render replaces the ephemeral instance. Burmese is supported by Eleven v3; the bot defaults to that model. See [ElevenLabs API pricing](https://elevenlabs.io/pricing/api), [supported languages](https://elevenlabs.io/docs/help-center/other/what-languages-do-you-support), and [Instant Voice Cloning plan eligibility](https://elevenlabs.io/docs/help-center/product/voices/my-voices/what-is-my-voices).
 
 ## Render deployment
 
 1. Create a private GitHub repository and push this project.
 2. In Render, choose **New → Blueprint**, select the repository, and apply `render.yaml`.
-3. Enter `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` when Render asks for secret values.
+3. Enter `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY`. To enable ElevenLabs, add `ELEVENLABS_API_KEYS` with a comma-separated key list, or add `ELEVENLABS_API_KEY` for one key. Do not put secrets in `render.yaml` or `.env.example`.
 4. Confirm the service is a **Web Service** on the `free` plan.
 5. After deployment, open the service URL plus `/health`. It should return:
 
@@ -65,13 +74,21 @@ python test_config.py
 python bot.py
 ```
 
-## Bot commands
+## Telegram menu and commands
+
+Use `/start` to open the inline menu. Select Gemini TTS, ElevenLabs Voice Clone & TTS, Fish Audio Voice Engine, Check Remaining Credits / Usage Stats, or Help / Guide. Selecting an engine updates only that user's active session; switching away clears pending local Fish Audio sample state while keeping any created ElevenLabs voice ID available in the chat. Gemini voice, speed, style, and multi-speaker settings remain available under the menu's settings button.
+
+To test ElevenLabs after adding a key, open `/start`, choose **ElevenLabs Voice Clone & TTS**, and send a clean audio clip of 10–180 seconds. For best results, use 1–2 minutes of one speaker with little background noise. After the clone is created, send Burmese text. This feature sends the supplied sample to ElevenLabs to create a provider-side voice, so use only your own voice or audio you have explicit permission to clone. On Free tier, TTS may use the account's included characters, but Instant Voice Cloning itself requires Starter or above.
+
+The usage menu is local-only and makes no API request. Its estimate applies the configured per-key budget for the current UTC month and should not be interpreted as the account's actual available balance.
+
+## Legacy bot commands
 
 - `/start`
 - `/setvoice` — complete Gemini prebuilt voice catalog
 - `/setspeed` — Slow, Normal, Fast
-- `/clonevoice` — optional Fish Audio voice cloning; use a clear 15–30 second reference sample and an exact transcript. Add `FISH_AUDIO_API_KEY` in Render Environment (`VOICE_CLONE_API_KEY` and `FISH_API_KEY` remain supported aliases). Once setup is complete, send text for clone TTS or a Burmese voice note for transcription followed by synthesis in the saved reference voice. Voice-note output depends on transcription quality and is not direct acoustic voice conversion or a guarantee of perfect pronunciation.
-- `/cancelclone` — remove the temporary clone sample and return to Gemini TTS.
+- `/clonevoice` — legacy command to start Fish Audio voice cloning; use a clear 15–30 second reference sample and an exact transcript. Add `FISH_AUDIO_API_KEY` in Render Environment (`VOICE_CLONE_API_KEY` and `FISH_API_KEY` remain supported aliases). Once setup is complete, send text for clone TTS or a Burmese voice note for transcription followed by synthesis in the saved reference voice. Voice-note output depends on transcription quality and is not direct acoustic voice conversion or a guarantee of perfect pronunciation.
+- `/cancelclone` — clear clone session state and return to the default Gemini TTS engine.
 
 For Burmese clone speech, the bot normalizes Unicode to NFC, tidies whitespace, converts Myanmar digits to standard Arabic digits in synthesis text, and preserves Burmese combining marks and joiners. The reference transcript keeps its original spoken words and digit forms, with spacing cleanup only, so it stays aligned with the uploaded sample. Fish Audio's text rewriter is disabled for clone requests because its documented number-normalization language list does not include Burmese. Synthesis uses the documented `s2.1-pro-free` model and MP3 output at 44.1 kHz / 192 kbps, with the provider's documented sampling defaults.
 

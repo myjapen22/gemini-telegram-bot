@@ -12,6 +12,10 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: ELEVENLABS_API_KEYS
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
       - key: ALLOWED_TELEGRAM_USER_IDS
         value: "7589831382"
       - key: GEMINI_MODEL
@@ -24,3 +28,7 @@ services:
         value: normal
       - key: MAX_TEXT_LENGTH
         value: "4000"
+      - key: ELEVENLABS_TTS_MODEL
+        value: eleven_v3
+      - key: ELEVENLABS_LOCAL_CHAR_QUOTA_PER_KEY
+        value: "10000"
